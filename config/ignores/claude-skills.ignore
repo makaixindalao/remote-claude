@@ -1,0 +1,7 @@
+# ~/.claude/skills 的忽略规则
+.DS_Store
+
+# claude.ai 下发的技能由 Claude Code 自己维护（synced/ 下是 bucket 目录加
+# .bucket-* 标记文件）。它有自己的下发与清理逻辑，再叠一层双向同步只会打架，
+# 让两端各自去 claude.ai 拉就行。手写的 skill 不在这个目录下，不受影响。
+synced/

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# scc — 在远程项目目录里跑 Claude Code（mosh + tmux）
+#
+#   scc                     在当前目录对应的远程目录启动 claude
+#   scc -r                  透传任意 claude 参数
+#   scc -p "写个函数"        带引号的参数也能正确传递
+#   scc --session <name>    自定义 tmux 会话名（默认 cc-<目录名>）
+#   scc --new               同目录已有 claude 时不接回，另开一个（cc-xxx-2、-3…）
+#   scc --ssh               走 SSH 而非 mosh。mosh 会丢弃 dim 属性（SGR 2），
+#                           claude 输入框的灰色建议文本因此显示成正常亮度；
+#                           SSH 原样透传，代价是失去本地回显预测（打字要等一个往返）
+#
+# 默认补 --dangerously-skip-permissions（你已显式传过则不重复补）
+# 会话名默认取当前目录名加 cc- 前缀，所以同一项目重复执行会接回正在跑的那个，
+# 而不是开出第二个 claude。
+# 主机与路径映射沿用 sshv：SSHV_HOST / SSHV_LOCAL_ROOT / SSHV_REMOTE_ROOT
+
+set -uo pipefail
+
+# ---- 统一配置 ----
+# remote-claude 的 config（主机、路径映射）存在就先读进来，这样三个脚本和
+# rcsync 共用同一份主机/路径定义，不会出现"同步到 A、SSH 连 B"的错位。
+# 显式导出的环境变量优先级仍然最高，能盖掉 config 里的值。
+RC_HOME="${RC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/remote-claude}"
+[ -f "$RC_HOME/config" ] && . "$RC_HOME/config"
+
+SKIP_FLAG="--dangerously-skip-permissions"
+
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# 优先用与自己同目录的 sshv：装成软链接时解开链接找到仓库里的真身，
+# 于是 clone 下来不装也能直接 ./bin/scc 跑，且不会误用 PATH 上的旧版本。
+self="$0"
+while [ -L "$self" ]; do
+    link="$(readlink "$self")"
+    case "$link" in
+        /*) self="$link" ;;
+        *)  self="$(dirname "$self")/$link" ;;
+    esac
+done
+SSHV="$(cd "$(dirname "$self")" && pwd)/sshv"
+[ -x "$SSHV" ] || SSHV="$(command -v sshv 2>/dev/null || true)"
+[ -n "$SSHV" ] && [ -x "$SSHV" ] || {
+    printf 'scc: 找不到 sshv（应与本脚本同目录，或在 PATH 里）\n' >&2; exit 1
+}
+
+# 只拦截 scc 自己的几个开关，其余一律透传给 claude。
+# --new 安全：claude 的 -n 是 --name，没有 --new（已核对过它的参数表）。
+session=""
+force_new=0
+use_ssh=0
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --session)   [ $# -ge 2 ] || { echo "scc: --session 需要参数" >&2; exit 1; }
+                     session="$2"; shift 2 ;;
+        --session=*) session="${1#--session=}"; shift ;;
+        --new)       force_new=1; shift ;;
+        --ssh)       use_ssh=1; shift ;;
+        --scc-help)  usage 0 ;;
+        *)           args+=("$1"); shift ;;
+    esac
+done
+
+# 没带任何参数时 -h 给 scc 自己的帮助；带了参数就当是要问 claude
+if [ ${#args[@]} -eq 0 ]; then
+    :
+else
+    case "${args[0]}" in
+        -h|--help) usage 0 ;;
+    esac
+fi
+
+# 已经显式传过就不重复补
+skip="$SKIP_FLAG"
+for a in ${args[@]+"${args[@]}"}; do
+    [ "$a" = "$SKIP_FLAG" ] && { skip=""; break; }
+done
+
+# POSIX 安全的 shell 引用。不用 printf %q：bash 3.2 会把非 ASCII 转成
+# $'\xxx' 这种 bash 专有写法，而远程 /bin/sh 是 dash 时不认，中文参数会被打散。
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+cmd="claude"
+[ -n "$skip" ] && cmd="$cmd $skip"
+for a in ${args[@]+"${args[@]}"}; do
+    cmd="$cmd $(shq "$a")"
+done
+
+# env -u TMUX：claude 一旦检测到 TMUX 变量就把颜色降级到 256 色调色板，
+#   它本要输出的暗灰（#888888 / #999999）被压成 244/246 号色，看上去明显偏白。
+#   实测对照：剥掉该变量 → 24-bit 15 处 / 256 色 6 处；保留 → 24-bit 0 处 / 256 色 22 处。
+#   注意 FORCE_COLOR=3 覆盖不了它，只能把变量摘掉。
+#   代价：claude 内部跑的命令感知不到自己在 tmux 里（tmux 的会话持久完全不受影响）。
+prefix="env -u TMUX -u TMUX_PANE"
+
+# claude 拒绝以 root 使用 --dangerously-skip-permissions（"cannot be used with
+# root/sudo privileges for security reasons"），而这台机器的 SSH 用户就是 root。
+# IS_SANDBOX=1 是 Claude Code 给容器/沙箱环境留的绕过口，已实测有效。
+case "$cmd" in
+    *--dangerously-skip-permissions*) prefix="$prefix IS_SANDBOX=1" ;;
+esac
+cmd="$prefix $cmd"
+
+# 会话名：cc-<目录名>。去掉前导点（否则 ~/.ssh 会得到 cc--ssh），
+# 并把 tmux 不接受的 . 和 : 换成 -
+if [ -z "$session" ]; then
+    session="cc-$(basename "$PWD" | sed 's/^\.*//' | tr '.:' '--')"
+    [ "$session" = "cc-" ] && session="cc"
+fi
+
+sshv_args=()
+[ "$force_new" = 1 ] && sshv_args+=(--new)
+[ "$use_ssh" = 1 ] && sshv_args+=(--ssh)
+sshv_args+=(--run "$cmd" add "$session")
+
+exec "$SSHV" "${sshv_args[@]}"

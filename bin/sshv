@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# sshv — mosh + tmux 远程会话管理
+#
+#   sshv                新建会话（自动编号）并连接
+#   sshv add <name>     新建名为 <name> 的会话并连接
+#   sshv <name>         连接到已有会话 <name>
+#   sshv -c             续连上次的会话
+#   sshv ls             列出所有会话
+#   sshv rm <name>      删除会话
+#
+#   --host/-H <host>    指定主机（默认 vps-64，或环境变量 SSHV_HOST）
+#   --ssh               走 SSH 而非 mosh（需要端口转发时用）
+#   --predict <mode>    本地回显预测 always|adaptive|never（默认 always）
+#   --bare              不套 tmux，纯 mosh（预测效果最好，但无会话持久）
+#   --cd <path>         指定远程起始目录（默认按当前目录自动映射）
+#   --no-cd             不做路径映射，用远程默认目录
+#   --run <cmd>         在会话里跑指定命令而非默认 shell（接回已有会话时忽略）
+#   --new               同名会话已存在时不接回，另开一个（自动加 -2 -3 后缀）
+#   --attach/-a         强制接回，即使本机另有窗口正连着它（会踢掉那个窗口）
+#
+# 路径映射：本地 ~/workspace/X 自动对应远程 /root/X（合 Mutagen 的同步布局）
+#           可用 SSHV_LOCAL_ROOT / SSHV_REMOTE_ROOT 覆盖
+#           仅在「新建」会话时生效，接回已有会话会保持它原来的现场
+
+set -uo pipefail
+
+# ---- 统一配置 ----
+# remote-claude 的 config（主机、路径映射）存在就先读进来，这样三个脚本和
+# rcsync 共用同一份主机/路径定义，不会出现"同步到 A、SSH 连 B"的错位。
+# 显式导出的环境变量优先级仍然最高，能盖掉 config 里的值。
+RC_HOME="${RC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/remote-claude}"
+[ -f "$RC_HOME/config" ] && . "$RC_HOME/config"
+
+DEFAULT_HOST="${SSHV_HOST:-${RC_HOST:-vps-64}}"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sshv"
+STATE_FILE="$STATE_DIR/last"
+ACTIVE_FILE="$STATE_DIR/active"
+
+host="$DEFAULT_HOST"
+use_ssh=0
+bare=0
+# always 而非 mosh 默认的 adaptive：231ms 这种固定高延迟链路，
+# adaptive 会在"没把握"时放弃预测，always 让预测始终可见（带下划线，确认后消失）
+predict="${SSHV_PREDICT:-always}"
+# 路径映射的两端：默认贴合 Mutagen 的同步布局 ~/workspace/X ↔ /root/X
+local_root="${SSHV_LOCAL_ROOT:-${RC_LOCAL_ROOT:-$HOME/workspace}}"
+remote_root="${SSHV_REMOTE_ROOT:-${RC_REMOTE_ROOT:-/root}}"
+remote_dir=""
+no_cd=0
+run_cmd=""
+force_new=0
+force_attach=0
+
+die()  { printf 'sshv: %s\n' "$*" >&2; exit 1; }
+info() {
+    # 只在终端里上色，被管道/重定向时输出纯文本
+    if [ -t 2 ]; then
+        printf '\033[2m%s\033[0m\n' "$*" >&2
+    else
+        printf '%s\n' "$*" >&2
+    fi
+}
+
+usage() {
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+# tmux 会话名不能含 . 或 :
+check_name() {
+    [ -n "$1" ] || die "会话名不能为空"
+    case "$1" in
+        *[.:]*) die "会话名不能包含 '.' 或 ':'（tmux 限制）" ;;
+        -*)     die "会话名不能以 '-' 开头" ;;
+    esac
+}
+
+# 查询远程会话名列表（用 ssh 而非 mosh：只是查询，ssh 更快且不需要 TTY）
+list_sessions() {
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" \
+        'tmux ls -F "#{session_name}" 2>/dev/null' 2>/dev/null
+}
+
+# 带窗口数/attach 状态的详细列表
+list_verbose() {
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" \
+        'tmux ls 2>/dev/null' 2>/dev/null
+}
+
+session_exists() {
+    list_sessions | grep -qx -- "$1"
+}
+
+# 在 base 后追加 -2 -3 … 直到不与现有会话重名
+# existing 由调用方传入，避免重复一次 ssh 往返
+uniq_name() {
+    local base="$1" existing="$2" n=2
+    while printf '%s\n' "$existing" | grep -qx -- "${base}-${n}"; do
+        n=$((n + 1))
+    done
+    printf '%s-%s' "$base" "$n"
+}
+
+# 找最小的未占用数字作为新会话名
+next_name() {
+    local existing i
+    existing="$(list_sessions)"
+    i=1
+    while printf '%s\n' "$existing" | grep -qx -- "$i"; do
+        i=$((i + 1))
+    done
+    printf '%s' "$i"
+}
+
+save_last() {
+    mkdir -p "$STATE_DIR"
+    printf '%s\t%s\n' "$host" "$1" > "$STATE_FILE"
+}
+
+# ---- 本机活跃连接登记 ----
+# 为什么不看远端的 session_attached：mosh 断线后 mosh-server 仍持有 tmux client，
+# 远端照样显示 attached=1、activity 也在更新，区分不出「你正用着」和「你断线了」。
+# 而本机这个 sshv 进程是否还活着，恰好就是这两者的区别本身。
+
+prune_active() {
+    [ -f "$ACTIVE_FILE" ] || return 0
+    local tmp="$ACTIVE_FILE.$$" pid h s
+    : > "$tmp"
+    while IFS="$(printf '\t')" read -r pid h s; do
+        [ -n "${pid:-}" ] || continue
+        # 进程还在 = 那条连接还活着；已退出的（含被强杀的）在这里被清掉
+        kill -0 "$pid" 2>/dev/null && printf '%s\t%s\t%s\n' "$pid" "$h" "$s" >> "$tmp"
+    done < "$ACTIVE_FILE"
+    mv -f "$tmp" "$ACTIVE_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+locally_active() {
+    [ -f "$ACTIVE_FILE" ] || return 1
+    awk -F"\t" -v h="$host" -v s="$1" '$2==h && $3==s {f=1} END{exit !f}' "$ACTIVE_FILE"
+}
+
+mark_active() {
+    mkdir -p "$STATE_DIR"
+    printf '%s\t%s\t%s\n' "$$" "$host" "$1" >> "$ACTIVE_FILE"
+}
+
+unmark_active() {
+    [ -f "$ACTIVE_FILE" ] || return 0
+    local tmp="$ACTIVE_FILE.$$"
+    grep -v "^$$$(printf '\t')" "$ACTIVE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
+    mv -f "$tmp" "$ACTIVE_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+# 把当前所在的本地目录映射成远程路径；不在映射范围内返回空
+map_path() {
+    local p="$PWD"
+    case "$p" in
+        "$local_root")   printf '%s' "$remote_root" ;;
+        "$local_root"/*) printf '%s/%s' "$remote_root" "${p#"$local_root"/}" ;;
+        *)               printf '' ;;
+    esac
+}
+
+remote_dir_exists() {
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "[ -d \"$1\" ]" 2>/dev/null
+}
+
+# 决定这次连接要落在哪个远程目录（空 = 用远程默认）
+resolve_dir() {
+    local d=""
+    if [ "$no_cd" = 1 ]; then
+        printf ''; return
+    fi
+    if [ -n "$remote_dir" ]; then
+        d="$remote_dir"           # --cd 显式指定
+    else
+        d="$(map_path)"           # 从 $PWD 推导
+    fi
+    [ -n "$d" ] || { printf ''; return; }
+    # 远程不存在就放弃：tmux new -c 指向不存在的目录会直接失败
+    if remote_dir_exists "$d"; then
+        printf '%s' "$d"
+    else
+        info "远程无此目录，忽略: $d"
+        printf ''
+    fi
+}
+
+connect() {
+    local name="$1"
+    local dir
+
+    # 先登记再做那两次 ssh 往返（查会话、验目录）。登记晚了会留出约 1 秒的窗口，
+    # 期间另开的窗口会误判成「没人连着」而去接回，把这边踢下线。
+    if [ "$bare" != 1 ]; then
+        mark_active "$name"
+        trap 'unmark_active' EXIT INT TERM HUP
+    fi
+
+    dir="$(resolve_dir)"
+
+    if [ "$bare" = 1 ]; then
+        info "→ ${host}${dir:+  [$dir]} (裸 mosh，无 tmux，断开即丢)"
+    else
+        save_last "$name"
+        info "→ ${host} : ${name}${dir:+  [$dir]}${run_cmd:+  \$ $run_cmd}"
+    fi
+
+    # ---- 裸模式：不套 tmux ----
+    if [ "$bare" = 1 ]; then
+        local inner="exec \$SHELL -l"
+        [ -n "$run_cmd" ] && inner="exec $run_cmd"
+        [ -n "$dir" ] && inner="cd \"$dir\" && $inner"
+        if [ "$use_ssh" = 1 ]; then
+            exec ssh -t "$host" "$inner"
+        fi
+        command -v mosh >/dev/null 2>&1 || die "未安装 mosh（brew install mosh），或加 --ssh 走 SSH"
+        if [ "$inner" = "exec \$SHELL -l" ]; then
+            exec mosh --predict="$predict" "$host"
+        fi
+        exec mosh --predict="$predict" "$host" -- sh -c "$inner"
+    fi
+
+    # ---- tmux 模式 ----
+    # new -A -D：存在则接回、不存在则创建，一条命令幂等
+    # -D 踢掉断线残留的僵尸 client，避免窗口被拉成两者中最小的尺寸
+    # -c 和末尾的命令都只在「新建」时生效；接回已有会话时 tmux 会忽略它们，保留原现场
+    local tcmd=(tmux new -A -D -s "$name")
+    [ -n "$dir" ]     && tcmd+=(-c "$dir")
+    [ -n "$run_cmd" ] && tcmd+=("$run_cmd")
+
+    # 这里不能用 exec —— 换掉进程映像就没机会在退出时把登记清掉，
+    # 下次判断会误以为还连着。
+    local rc=0
+    if [ "$use_ssh" = 1 ]; then
+        # ssh 收的是一整条 shell 字符串，逐个参数做 shell 引用
+        local scmd="" a
+        for a in "${tcmd[@]}"; do
+            scmd="$scmd $(printf '%q' "$a")"
+        done
+        ssh -t "$host" "$scmd"; rc=$?
+    else
+        command -v mosh >/dev/null 2>&1 || die "未安装 mosh（brew install mosh），或加 --ssh 走 SSH"
+        mosh --predict="$predict" "$host" -- "${tcmd[@]}"; rc=$?
+    fi
+    unmark_active
+    exit "$rc"
+}
+
+show_sessions() {
+    local out
+    out="$(list_verbose)"
+    if [ -z "$out" ]; then
+        printf '%s 上没有 tmux 会话\n' "$host"
+    else
+        printf '%s 上的会话:\n%s\n' "$host" "$out"
+    fi
+}
+
+# ---- 参数解析 ----
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host|-H) [ $# -ge 2 ] || die "--host 需要参数"; host="$2"; shift 2 ;;
+        --ssh)     use_ssh=1; shift ;;
+        --bare)    bare=1; shift ;;
+        --cd)      [ $# -ge 2 ] || die "--cd 需要参数"; remote_dir="$2"; shift 2 ;;
+        --cd=*)    remote_dir="${1#--cd=}"; shift ;;
+        --no-cd)   no_cd=1; shift ;;
+        --run)     [ $# -ge 2 ] || die "--run 需要参数"; run_cmd="$2"; shift 2 ;;
+        --run=*)   run_cmd="${1#--run=}"; shift ;;
+        --new)     force_new=1; shift ;;
+        --attach|-a) force_attach=1; shift ;;
+        --predict) [ $# -ge 2 ] || die "--predict 需要参数"; predict="$2"; shift 2 ;;
+        --predict=*) predict="${1#--predict=}"; shift ;;
+        --help)    usage 0 ;;
+        -h)        usage 0 ;;
+        -c|--continue) args+=("__continue__"); shift ;;
+        --)        shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+        -*)        die "未知选项: $1（--help 查看用法）" ;;
+        *)         args+=("$1"); shift ;;
+    esac
+done
+
+cmd="${args[0]:-}"
+
+case "$cmd" in
+    "")
+        if [ "$bare" = 1 ]; then
+            # --bare 不涉及会话，直接连
+            connect ""
+        fi
+        # 无参数：新建一个自动编号的会话
+        name="$(next_name)" || die "无法连接 $host"
+        info "新建会话 $name"
+        connect "$name"
+        ;;
+
+    __continue__)
+        [ -f "$STATE_FILE" ] || die "没有上次的记录，先用 sshv 或 sshv add <name> 建一个"
+        IFS=$'\t' read -r last_host last_name < "$STATE_FILE"
+        [ -n "${last_name:-}" ] || die "上次的记录已损坏"
+        host="${last_host:-$host}"
+        if session_exists "$last_name"; then
+            connect "$last_name"
+        else
+            info "上次的会话 '$last_name' 已不存在"
+            show_sessions
+            exit 1
+        fi
+        ;;
+
+    ls|list)
+        show_sessions
+        ;;
+
+    add|new)
+        name="${args[1]:-}"
+        [ -n "$name" ] || die "用法: sshv add <name>"
+        check_name "$name"
+        # 一次取全量会话列表，下面两处判断共用，省一次往返
+        prune_active
+        sessions="$(list_sessions)"
+        if printf '%s\n' "$sessions" | grep -qx -- "$name"; then
+            if [ "$force_new" = 1 ]; then
+                name="$(uniq_name "$name" "$sessions")"
+                info "已有同名会话，另开一个: $name"
+            elif [ "$force_attach" = 1 ]; then
+                info "接回会话 '$name'（--attach，会踢掉正连着它的窗口）"
+            elif locally_active "$name"; then
+                # 本机另一个窗口正连着它。接回会因 -D 把那个窗口踢下线，
+                # 显然不是想要的结果，所以自动另开一个。
+                newn="$(uniq_name "$name" "$sessions")"
+                info "'$name' 正被本机另一个窗口用着，自动另开: $newn"
+                name="$newn"
+            else
+                info "接回会话 '$name'"
+            fi
+        fi
+        connect "$name"
+        ;;
+
+    rm|kill)
+        name="${args[1]:-}"
+        [ -n "$name" ] || die "用法: sshv rm <name>"
+        check_name "$name"
+        session_exists "$name" || die "会话 '$name' 不存在"
+        ssh -o BatchMode=yes "$host" "tmux kill-session -t '$name'" \
+            && printf "已删除会话 '%s'\n" "$name"
+        ;;
+
+    *)
+        # 直接给名字：连接已有会话
+        check_name "$cmd"
+        if session_exists "$cmd"; then
+            connect "$cmd"
+        else
+            # 不自动创建：防止拼错名字时悄悄建出一堆垃圾会话
+            info "会话 '$cmd' 不存在"
+            show_sessions
+            printf '\n要创建请用: sshv add %s\n' "$cmd" >&2
+            exit 1
+        fi
+        ;;
+esac

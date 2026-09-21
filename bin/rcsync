@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+# rcsync — 本地 ↔ VPS 的 Mutagen 同步统一入口（代码 / skills / Claude 会话）
+#
+#   rcsync up [目标...]        创建或恢复同步（默认全部）
+#   rcsync down [目标...]      终止同步（只停同步，不动任何文件）
+#   rcsync status [目标...]    状态一览
+#   rcsync list                只看配置推导出的目标和路径映射，不查 Mutagen
+#   rcsync flush [目标...]     立刻强制同步一轮并等它完成
+#   rcsync pause|resume [目标...]
+#   rcsync monitor <目标>      实时刷新单个目标的状态
+#   rcsync conflicts           列出所有冲突及涉及的文件
+#   rcsync resolve <目标> alpha|beta   以某一端为准解决该目标的冲突
+#   rcsync doctor              体检：依赖、守护进程、SSH、远端工具、路径推导
+#
+#   -y / --yes                 跳过确认（新建同步、终止、解冲突都会确认）
+#
+# 目标可以写：项目名（myapp）、sess-<项目名>、skills、
+#             或分组 all / code / sessions / skills（不给参数 = all）
+#
+# 配置在 $RC_HOME/config（默认 ~/.config/remote-claude/config），
+# 和 sshv / scc / ccv 共用，保证"同步到哪台"和"SSH 连哪台"永远是同一台。
+
+set -uo pipefail
+
+# ---- 定位仓库与配置 ----
+self="$0"
+while [ -L "$self" ]; do
+    link="$(readlink "$self")"
+    case "$link" in
+        /*) self="$link" ;;
+        *)  self="$(dirname "$self")/$link" ;;
+    esac
+done
+BIN_DIR="$(cd "$(dirname "$self")" && pwd)"
+REPO_DIR="$(cd "$BIN_DIR/.." && pwd)"
+
+RC_HOME="${RC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/remote-claude}"
+
+die()  { printf 'rcsync: %s\n' "$*" >&2; exit 1; }
+info() { if [ -t 2 ]; then printf '\033[2m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
+warn() { if [ -t 2 ]; then printf '\033[33m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
+ok()   { if [ -t 2 ]; then printf '\033[32m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
+
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# 帮助要在读配置之前就能出来，否则"还没配置"的人连用法都看不到
+for a in "$@"; do
+    case "$a" in -h|--help|help) usage 0 ;; esac
+done
+
+CONF="${RC_CONFIG:-}"
+if [ -z "$CONF" ]; then
+    if   [ -f "$RC_HOME/config" ];       then CONF="$RC_HOME/config"
+    elif [ -f "$REPO_DIR/config/config" ]; then CONF="$REPO_DIR/config/config"
+    fi
+fi
+[ -n "$CONF" ] && [ -f "$CONF" ] || die "没有配置文件。先跑 $REPO_DIR/install.sh，或 cp $REPO_DIR/config/config.example $RC_HOME/config"
+# shellcheck disable=SC1090
+. "$CONF"
+
+RC_HOST="${RC_HOST:-vps-64}"
+RC_LOCAL_ROOT="${RC_LOCAL_ROOT:-$HOME/workspace}"
+RC_REMOTE_ROOT="${RC_REMOTE_ROOT:-/root}"
+RC_LOCAL_CLAUDE="${RC_LOCAL_CLAUDE:-$HOME/.claude}"
+RC_REMOTE_CLAUDE="${RC_REMOTE_CLAUDE:-/root/.claude}"
+RC_PREFIX="${RC_PREFIX:-rc}"
+RC_SYNC_SKILLS="${RC_SYNC_SKILLS:-1}"
+RC_SYNC_SESSIONS="${RC_SYNC_SESSIONS:-1}"
+
+# bash 3.2（macOS 自带）没有 ${arr[@]:-}，未定义数组在 set -u 下会炸，先补空
+declare -p RC_PROJECTS         >/dev/null 2>&1 || RC_PROJECTS=()
+declare -p RC_SESSION_PROJECTS >/dev/null 2>&1 || RC_SESSION_PROJECTS=()
+declare -p RC_EXTRA_PAIRS      >/dev/null 2>&1 || RC_EXTRA_PAIRS=()
+[ ${#RC_SESSION_PROJECTS[@]} -gt 0 ] || RC_SESSION_PROJECTS=(${RC_PROJECTS[@]+"${RC_PROJECTS[@]}"})
+
+IGNORE_DIR="$RC_HOME/ignores"
+[ -d "$IGNORE_DIR" ] || IGNORE_DIR="$REPO_DIR/config/ignores"
+
+ASSUME_YES=0
+
+# 内部表格的列分隔符。不能用 \t：tab 属于 IFS 空白，read 会把连续的 tab
+# 当成一个分隔符，于是"空列"整列消失、后面的列全部前移。0x1F(US) 没这个毛病。
+SEP="$(printf '\037')"
+
+command -v mutagen >/dev/null 2>&1 || die "没装 mutagen（brew install mutagen-io/mutagen/mutagen）"
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/rcsync.XXXXXX")" || die "无法创建临时目录"
+trap 'rm -rf "$TMP"' EXIT INT TERM HUP
+
+# ---- 小工具 ----
+
+# Claude Code 把项目目录名按"非字母数字一律换成 -"编码进 ~/.claude/projects/
+# 实测对照：/root/my_sdk → -root-my-sdk（下划线也变 -）
+#           /root/mytool/.claude/... → -root-mytool--claude-...（/. 变 --）
+mangle() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+# Mutagen 会话名只收字母数字和 -，项目名里的 _ 、. 都要换掉
+sanitize() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g; s/--*/-/g; s/^-//; s/-$//'; }
+
+# 去掉末尾斜杠，好和 Mutagen 回报的路径逐字比对
+norm() { printf '%s' "$1" | sed 's://*:/:g; s:\(.\)/$:\1:'; }
+
+# POSIX 安全的 shell 引用（远端 /bin/sh 可能是 dash，不能用 printf %q）
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+confirm() {
+    [ "$ASSUME_YES" = 1 ] && return 0
+    # 固定从 /dev/tty 读，而不是 stdin —— 几处确认是在 while read < 文件 的循环里
+    # 调的，用 stdin 会把计划文件的下一行当成你的回答吃掉。
+    [ -e /dev/tty ] || die "非交互环境下需要 -y 才能继续"
+    printf '%s [y/N] ' "$1" > /dev/tty
+    local ans; read -r ans < /dev/tty || return 1
+    case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ---- 目标表 ----
+# 每行： 名字 \t 种类 \t alpha路径 \t beta路径(远端) \t ignore文件(逗号分隔)
+#        \t 额外 mutagen 参数 \t 是否允许自动建目录(1/0)
+
+build_targets() {
+    local spec lname rname name
+    for spec in ${RC_PROJECTS[@]+"${RC_PROJECTS[@]}"}; do
+        [ -n "$spec" ] || continue
+        lname="${spec%%:*}"
+        rname="${spec#*:}"; [ "$rname" = "$spec" ] && rname="$lname"
+        name="$(sanitize "$lname")"
+        printf "%s${SEP}code${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}0\n" \
+            "$name" \
+            "$(norm "$RC_LOCAL_ROOT/$lname")" \
+            "$(norm "$RC_REMOTE_ROOT/$rname")" \
+            "common.ignore,$name.ignore" \
+            ""
+    done
+
+    if [ "$RC_SYNC_SESSIONS" = 1 ]; then
+        for spec in ${RC_SESSION_PROJECTS[@]+"${RC_SESSION_PROJECTS[@]}"}; do
+            [ -n "$spec" ] || continue
+            lname="${spec%%:*}"
+            rname="${spec#*:}"; [ "$rname" = "$spec" ] && rname="$lname"
+            name="sess-$(sanitize "$lname")"
+            # 两端目录名不同（本地按 /Users/... 编码、远端按 /root/... 编码），
+            # 所以只能一个项目配一对，不能整个 projects/ 目录对同步。
+            printf "%s${SEP}sessions${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}1\n" \
+                "$name" \
+                "$(norm "$RC_LOCAL_CLAUDE/projects/$(mangle "$(norm "$RC_LOCAL_ROOT/$lname")")")" \
+                "$(norm "$RC_REMOTE_CLAUDE/projects/$(mangle "$(norm "$RC_REMOTE_ROOT/$rname")")")" \
+                "claude-sessions.ignore" \
+                "--default-file-mode=0600 --default-directory-mode=0700"
+        done
+    fi
+
+    if [ "$RC_SYNC_SKILLS" = 1 ]; then
+        printf "%s${SEP}skills${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}1\n" \
+            "skills" \
+            "$(norm "$RC_LOCAL_CLAUDE/skills")" \
+            "$(norm "$RC_REMOTE_CLAUDE/skills")" \
+            "claude-skills.ignore" \
+            ""
+    fi
+
+    local pair
+    for pair in ${RC_EXTRA_PAIRS[@]+"${RC_EXTRA_PAIRS[@]}"}; do
+        [ -n "$pair" ] || continue
+        local n l r
+        n="${pair%%|*}"; pair="${pair#*|}"
+        l="${pair%%|*}"; r="${pair#*|}"
+        [ -n "$n" ] && [ -n "$l" ] && [ -n "$r" ] || { warn "RC_EXTRA_PAIRS 格式应为 名字|本地路径|远端路径，跳过: $pair"; continue; }
+        printf "%s${SEP}extra${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}1\n" \
+            "$(sanitize "$n")" "$(norm "$l")" "$(norm "$r")" "$(sanitize "$n").ignore" ""
+    done
+}
+
+TARGETS="$TMP/targets"
+build_targets > "$TARGETS"
+[ -s "$TARGETS" ] || die "配置里没有任何同步目标（检查 $CONF 的 RC_PROJECTS）"
+
+# 按用户给的参数筛目标；没给参数 = all
+select_targets() {
+    local out="$TMP/selected"; : > "$out"
+    if [ $# -eq 0 ]; then cp "$TARGETS" "$out"; printf '%s' "$out"; return 0; fi
+    local arg hit
+    for arg in "$@"; do
+        case "$arg" in
+            all)                 cat "$TARGETS" >> "$out"; continue ;;
+            code|sessions|skills|extra)
+                                 awk -F"$SEP" -v k="$arg" '$2==k' "$TARGETS" >> "$out"; continue ;;
+        esac
+        hit="$(awk -F"$SEP" -v n="$(sanitize "$arg")" '$1==n' "$TARGETS")"
+        if [ -z "$hit" ]; then
+            # 允许直接写项目名来指代它的会话同步：rcsync up sess-xxx 也行
+            die "没有这个目标: ${arg}（rcsync list 看有哪些）"
+        fi
+        printf '%s\n' "$hit" >> "$out"
+    done
+    # 去重，保持顺序
+    awk '!seen[$0]++' "$out" > "$out.u" && mv "$out.u" "$out"
+    printf '%s' "$out"
+}
+
+# ---- Mutagen 现状（一次查询，全程复用）----
+MU_LIST="$TMP/mulist"
+mu_refresh() {
+    # {{if .SessionState}} 不能省：会话被 pause 后这个内嵌指针是 nil，
+    # 直接取 .Status / .Conflicts 会让整条模板报错——连带整张表查不出来，
+    # 于是"暂停了一个会话"会表现成"所有会话都不见了"。
+    mutagen sync list --template \
+'{{range .}}{{.Name}}{{"\x1f"}}{{.Alpha.Path}}{{"\x1f"}}{{.Beta.Host}}{{"\x1f"}}{{.Beta.Path}}{{"\x1f"}}{{if .SessionState}}{{.Status}}{{else}}Paused{{end}}{{"\x1f"}}{{.Paused}}{{"\x1f"}}{{if .SessionState}}{{len .Conflicts}}{{else}}0{{end}}{{"\x1f"}}{{index .Labels "managed-by"}}{{"\n"}}{{end}}' \
+        > "$MU_LIST" 2>"$TMP/muerr" || {
+        warn "查询 Mutagen 失败：$(cat "$TMP/muerr")"
+        : > "$MU_LIST"
+    }
+}
+
+# 按两端路径找现存会话（而不是按名字）——这样你之前手工建的同步会被直接认领，
+# 不会又建一条指向同一对目录的重复会话。
+find_session() {
+    awk -F"$SEP" -v a="$1" -v h="$2" -v b="$3" '$2==a && $3==h && $4==b {print $1; exit}' "$MU_LIST"
+}
+session_field() { awk -F"$SEP" -v n="$1" -v f="$2" '$1==n {print $f; exit}' "$MU_LIST"; }
+
+ignore_flags() {
+    local files="$1" f line
+    local IFS=','
+    for f in $files; do
+        [ -f "$IGNORE_DIR/$f" ] || continue
+        while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            printf '%s\n' "--ignore=$line"
+        done < "$IGNORE_DIR/$f"
+    done
+}
+
+# -n 不能省：这两个函数常在 while read < 文件 的循环里被调用，
+# 不切断 stdin 的话 ssh 会把剩下的行整个吞掉，循环只跑第一轮。
+remote_exists() {
+    ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$RC_HOST" "[ -e $(shq "$1") ]" 2>/dev/null
+}
+remote_mkdir() {
+    ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$RC_HOST" "mkdir -p $(shq "$1")" 2>/dev/null
+}
+
+# ---- 子命令 ----
+
+cmd_list() {
+    printf '%-22s %-9s %s\n' TARGET KIND PAIR
+    local sel; sel="$(select_targets "$@")" || exit 1
+    local name kind a b ign flags mk
+    while IFS="$SEP" read -r name kind a b ign flags mk; do
+        printf '%-22s %-9s %s  ⇄  %s:%s\n' "$name" "$kind" "${a/#$HOME/~}" "$RC_HOST" "$b"
+    done < "$sel"
+}
+
+cmd_status() {
+    mu_refresh
+    local sel; sel="$(select_targets "$@")" || exit 1
+    printf '%-22s %-22s %-24s %-5s %s\n' TARGET SESSION STATUS CONFL PAIR
+    local name kind a b ign flags mk s st pa cf
+    while IFS="$SEP" read -r name kind a b ign flags mk; do
+        s="$(find_session "$a" "$RC_HOST" "$b")"
+        if [ -z "$s" ]; then
+            printf '%-22s %-22s %-24s %-5s %s\n' "$name" '-' 'not-synced' '-' "${a/#$HOME/~}"
+            continue
+        fi
+        st="$(session_field "$s" 5)"; pa="$(session_field "$s" 6)"; cf="$(session_field "$s" 7)"
+        [ "$pa" = "true" ] && st="Paused"
+        printf '%-22s %-22s %-24s %-5s %s\n' "$name" "$s" "$st" "$cf" "${a/#$HOME/~}"
+    done < "$sel"
+}
+
+cmd_up() {
+    mu_refresh
+    local sel; sel="$(select_targets "$@")" || exit 1
+    local plan="$TMP/plan"; : > "$plan"
+    local name kind a b ign flags mk s
+
+    # 先算清楚要做什么，一次性给用户看，再动手
+    while IFS="$SEP" read -r name kind a b ign flags mk; do
+        s="$(find_session "$a" "$RC_HOST" "$b")"
+        if [ -n "$s" ]; then
+            if [ "$(session_field "$s" 6)" = "true" ]; then
+                printf "%s${SEP}resume${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s\n" "$name" "$a" "$b" "$ign" "$flags" "$mk" "$s" >> "$plan"
+            else
+                info "已在同步: ${name}（会话 ${s}）"
+            fi
+            continue
+        fi
+        printf "%s${SEP}create${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s\n" "$name" "$a" "$b" "$ign" "$flags" "$mk" "" >> "$plan"
+    done < "$sel"
+
+    [ -s "$plan" ] || { ok "全部目标都已在同步。"; return 0; }
+
+    local news; news="$(awk -F"$SEP" '$2=="create"' "$plan" | wc -l | tr -d ' ')"
+    if [ "$news" -gt 0 ]; then
+        printf '将新建 %s 条同步：\n' "$news" >&2
+        awk -F"$SEP" '$2=="create"{printf "  %s\n    %s\n  ⇄ %s\n", $1, $3, $4}' "$plan" >&2
+        printf '\n首次同步是双向合并：两端都有、但内容不同的文件会标成冲突保留双份，\n不会有文件被静默删除。确认要继续吗？\n' >&2
+        confirm "继续？" || { info "已取消"; return 1; }
+    fi
+
+    local act mname
+    while IFS="$SEP" read -r name act a b ign flags mk s; do
+        if [ "$act" = "resume" ]; then
+            mutagen sync resume "$s" >/dev/null 2>&1 && ok "已恢复: ${name}（会话 ${s}）" || warn "恢复失败: $name"
+            continue
+        fi
+
+        # 目录准备。会话/skills 这类元数据目录可以自动建；代码目录不自动建，
+        # 免得项目名敲错时悄悄拉下来一整个仓库。
+        if [ ! -d "$a" ]; then
+            if [ "$mk" = 1 ]; then
+                mkdir -p "$a" || { warn "$name: 无法创建 ${a}，跳过"; continue; }
+            else
+                if remote_exists "$b"; then
+                    confirm "$name: 本地没有 ${a}，从 $RC_HOST:$b 拉下来？" || { info "跳过 $name"; continue; }
+                    mkdir -p "$a" || { warn "$name: 无法创建 ${a}，跳过"; continue; }
+                else
+                    warn "$name: 两端都没有这个目录（$a / ${b}），跳过"
+                    continue
+                fi
+            fi
+        fi
+        [ "$mk" = 1 ] && remote_mkdir "$b"
+
+        mname="$RC_PREFIX-$name"
+        # 名字被占（多半是上次留下的同名会话指向了别处）就退回让 Mutagen 自己起名
+        if awk -F"$SEP" -v n="$mname" '$1==n{f=1}END{exit !f}' "$MU_LIST"; then
+            warn "$name: Mutagen 里已有同名会话 $mname 但指向别的路径，本次不指定名字"
+            mname=""
+        fi
+
+        local -a cflags=()
+        [ -n "$mname" ] && cflags+=(--name "$mname")
+        cflags+=(--label "managed-by=remote-claude" --label "rc-target=$name")
+        local ig
+        while IFS= read -r ig; do [ -n "$ig" ] && cflags+=("$ig"); done < <(ignore_flags "$ign")
+        local ef
+        for ef in $flags; do cflags+=("$ef"); done
+
+        info "创建同步: $name"
+        if mutagen sync create "${cflags[@]}" "$a" "$RC_HOST:$b"; then
+            ok "已创建: $name"
+        else
+            warn "创建失败: $name"
+        fi
+    done < "$plan"
+}
+
+cmd_down() {
+    mu_refresh
+    local sel; sel="$(select_targets "$@")" || exit 1
+    local name kind a b ign flags mk s lbl
+    local hitlist="$TMP/down"; : > "$hitlist"
+    while IFS="$SEP" read -r name kind a b ign flags mk; do
+        s="$(find_session "$a" "$RC_HOST" "$b")"
+        [ -n "$s" ] || continue
+        lbl="$(session_field "$s" 8)"
+        printf "%s${SEP}%s${SEP}%s\n" "$name" "$s" "$lbl" >> "$hitlist"
+    done < "$sel"
+    [ -s "$hitlist" ] || { info "没有正在运行的同步。"; return 0; }
+
+    printf '将终止这些同步（只停同步，两端文件都保持原样）：\n' >&2
+    awk -F"$SEP" '{printf "  %s  (会话 %s)%s\n", $1, $2, ($3=="remote-claude"?"":"  ← 不是 rcsync 建的")}' "$hitlist" >&2
+    confirm "继续？" || { info "已取消"; return 1; }
+    local n s2 l
+    while IFS="$SEP" read -r n s2 l; do
+        mutagen sync terminate "$s2" >/dev/null 2>&1 && ok "已终止: $n" || warn "终止失败: $n"
+    done < "$hitlist"
+}
+
+# pause / resume / flush / monitor 走同一条通道
+cmd_simple() {
+    local verb="$1"; shift
+    mu_refresh
+    local sel; sel="$(select_targets "$@")" || exit 1
+    local name kind a b ign flags mk s any=0
+    while IFS="$SEP" read -r name kind a b ign flags mk; do
+        s="$(find_session "$a" "$RC_HOST" "$b")"
+        [ -n "$s" ] || { info "未创建，跳过: $name"; continue; }
+        any=1
+        if [ "$verb" = monitor ]; then
+            exec mutagen sync monitor "$s"
+        fi
+        info "$verb: ${name}（会话 ${s}）"
+        mutagen sync "$verb" "$s" || warn "$verb 失败: $name"
+    done < "$sel"
+    [ "$any" = 1 ] || info "没有可操作的会话。"
+}
+
+conflict_rows() {
+    mutagen sync list --template \
+'{{range .}}{{$n := .Name}}{{if .SessionState}}{{range .Conflicts}}{{$n}}{{"\x1f"}}{{.Root}}{{"\n"}}{{end}}{{end}}{{end}}' 2>/dev/null
+}
+
+cmd_conflicts() {
+    mu_refresh
+    local sel; sel="$(select_targets "$@")" || exit 1
+    local rows="$TMP/conf"; conflict_rows > "$rows"
+    local name kind a b ign flags mk s n=0
+    while IFS="$SEP" read -r name kind a b ign flags mk; do
+        s="$(find_session "$a" "$RC_HOST" "$b")"
+        [ -n "$s" ] || continue
+        local c; c="$(awk -F"$SEP" -v s="$s" '$1==s{print $2}' "$rows")"
+        [ -n "$c" ] || continue
+        n=$((n+1))
+        printf '\n%s  (会话 %s)\n' "$name" "$s"
+        printf '%s\n' "$c" | sed 's/^/    /'
+    done < "$sel"
+    if [ "$n" = 0 ]; then
+        ok "没有冲突。"
+    else
+        printf '\n两端都改过同一个文件，Mutagen 不会替你选，两份都留着。\n' >&2
+        printf '定好以哪端为准后： rcsync resolve <目标> alpha|beta\n' >&2
+        printf '（alpha = 本机，beta = %s）\n' "$RC_HOST" >&2
+    fi
+}
+
+cmd_resolve() {
+    local target="${1:-}" side="${2:-}"
+    [ -n "$target" ] && [ -n "$side" ] || die "用法: rcsync resolve <目标> alpha|beta"
+    case "$side" in alpha|beta) ;; *) die "只能是 alpha（本机）或 beta（${RC_HOST}）" ;; esac
+
+    mu_refresh
+    local sel; sel="$(select_targets "$target")" || exit 1
+    [ "$(wc -l < "$sel" | tr -d ' ')" = 1 ] || die "resolve 一次只处理一个目标，别用分组名"
+    local name kind a b ign flags mk s
+    IFS="$SEP" read -r name kind a b ign flags mk < "$sel"
+    s="$(find_session "$a" "$RC_HOST" "$b")"
+    [ -n "$s" ] || die "$name 还没在同步"
+
+    local rows="$TMP/conf"; conflict_rows > "$rows"
+    local roots; roots="$(awk -F"$SEP" -v s="$s" '$1==s{print $2}' "$rows")"
+    [ -n "$roots" ] || { ok "$name 没有冲突。"; return 0; }
+
+    local loser loser_root
+    if [ "$side" = alpha ]; then loser=beta;  loser_root="$b"; else loser=alpha; loser_root="$a"; fi
+
+    printf '以 %s 为准解决 %s 的冲突。\n将删掉 %s 端的这些路径，随后 Mutagen 会把 %s 端的版本同步过去：\n' \
+        "$side" "$name" "$loser" "$side" >&2
+    printf '%s\n' "$roots" | sed "s|^|    $loser:$loser_root/|" >&2
+    confirm "继续？" || { info "已取消"; return 1; }
+
+    local r
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        case "$r" in /*|*..*) warn "跳过可疑路径: $r"; continue ;; esac
+        if [ "$loser" = alpha ]; then
+            rm -rf -- "$a/$r" && info "已删除 本机:$a/$r"
+        else
+            ssh -n -o BatchMode=yes "$RC_HOST" "rm -rf -- $(shq "$loser_root/$r")" \
+                && info "已删除 $RC_HOST:$loser_root/$r"
+        fi
+    done <<EOF
+$roots
+EOF
+    info "触发一次同步…"
+    mutagen sync flush "$s" && ok "完成。再跑 rcsync conflicts 确认。"
+}
+
+cmd_doctor() {
+    local bad=0
+    printf '== 本机 ==\n'
+    local c
+    for c in mutagen mosh tmux ssh; do
+        if command -v "$c" >/dev/null 2>&1; then
+            printf '  ✓ %-8s %s\n' "$c" "$(command -v "$c")"
+        else
+            printf '  ✗ %-8s 缺失（brew install %s）\n' "$c" "$c"; bad=1
+        fi
+    done
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) printf '  ✓ PATH     含 ~/.local/bin\n' ;;
+        *) printf '  ✗ PATH     不含 ~/.local/bin，装好的命令敲不到\n'; bad=1 ;;
+    esac
+    if mutagen sync list >/dev/null 2>&1; then
+        printf '  ✓ daemon   Mutagen 守护进程可用\n'
+    else
+        printf '  ✗ daemon   起不来，试 mutagen daemon start\n'; bad=1
+    fi
+
+    printf '\n== %s ==\n' "$RC_HOST"
+    local t0 t1
+    t0=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || echo 0)
+    if ssh -o BatchMode=yes -o ConnectTimeout=15 "$RC_HOST" true 2>/dev/null; then
+        t1=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || echo 0)
+        if [ "$t0" != 0 ]; then printf '  ✓ ssh      通（握手 %s ms，走 ControlMaster 复用后会快很多）\n' "$((t1-t0))"
+        else printf '  ✓ ssh      通\n'; fi
+    else
+        printf '  ✗ ssh      连不上（检查 ~/.ssh/config 里的 Host %s）\n' "$RC_HOST"; bad=1
+        printf '\n后面的检查依赖 SSH，先修这个。\n'; return 1
+    fi
+    ssh -o BatchMode=yes "$RC_HOST" '
+        for c in tmux mosh-server claude; do
+            p=$(command -v $c 2>/dev/null)
+            if [ -n "$p" ]; then printf "  ✓ %-10s %s\n" "$c" "$p"
+            else printf "  ✗ %-10s 缺失\n" "$c"; fi
+        done
+    ' 2>/dev/null
+
+    printf '\n== 路径映射 ==\n'
+    local name kind a b ign flags mk
+    while IFS="$SEP" read -r name kind a b ign flags mk; do
+        local la ra
+        [ -e "$a" ] && la=有 || la=无
+        printf '  %-22s 本机:%s  远端:%s\n' "$name" "$la" "$(remote_exists "$b" && echo 有 || echo 无)"
+    done < "$TARGETS"
+    printf '\n（会话/skills 目录显示"无"只是还没产生过，up 时会自动建。\n'
+    printf '  代码目录两端都"无"才是配置写错了。）\n'
+
+    printf '\n== mosh ==\n'
+    printf '  mosh 走 UDP 60000-61000，若连不上先确认 VPS 防火墙/安全组放行了这段。\n'
+    return $bad
+}
+
+# ---- 参数 ----
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -y|--yes) ASSUME_YES=1; shift ;;
+        -h|--help) usage 0 ;;
+        --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- ${args[@]+"${args[@]}"}
+
+cmd="${1:-status}"; [ $# -gt 0 ] && shift
+
+case "$cmd" in
+    up|start)         cmd_up "$@" ;;
+    down|stop)        cmd_down "$@" ;;
+    status|st)        cmd_status "$@" ;;
+    list|ls)          cmd_list "$@" ;;
+    flush|pause|resume|monitor) cmd_simple "$cmd" "$@" ;;
+    conflicts|conf)   cmd_conflicts "$@" ;;
+    resolve)          cmd_resolve "$@" ;;
+    doctor)           cmd_doctor ;;
+    help)             usage 0 ;;
+    *)                die "未知命令: ${cmd}（rcsync --help 看用法）" ;;
+esac

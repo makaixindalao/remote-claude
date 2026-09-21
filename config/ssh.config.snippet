@@ -1,0 +1,27 @@
+# remote-claude 推荐的 Host 块 —— 追加到 ~/.ssh/config 后把 HostName/Port/User 填上。
+# 这三组参数不是可选优化：Mutagen 的长连接、mosh 的握手、sshv 的每次查询
+# 全都跑在这条 SSH 之上，任何一项缺失都会以"偶发卡顿/掉线"的形式冒出来。
+
+Host vps-64
+  HostName <你的 VPS IP>
+  User root
+  Port <端口>
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+
+  # --- 保活：每 15s 发心跳，连续 8 次(2分钟)无响应才判死 ---
+  # 心跳更密是为了防 NAT 表项老化；容忍次数更多是为了扛住网络抖动，两者要一起调
+  ServerAliveInterval 15
+  ServerAliveCountMax 8
+  TCPKeepAlive yes
+
+  # --- 连接复用：多个终端/VS Code channel 共享一条 TCP，重连近乎瞬时 ---
+  # sshv 每次查会话列表都要开一条 SSH，没有复用的话每条都要付一次完整握手
+  ControlMaster auto
+  ControlPath ~/.ssh/cm/%r@%h:%p
+  ControlPersist 30m
+
+  # --- 高延迟链路（实测 231ms），握手要给足时间并自动重试 ---
+  ConnectTimeout 20
+  ConnectionAttempts 3
+  Compression yes

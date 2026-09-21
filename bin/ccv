@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# ccv — 在本地跑 Claude Code，但用另一套独立账号（vps 上那个）
+#
+#   ccv [claude 的任意参数...]
+#
+# 为什么值得：UI 完全本地渲染，打字零延迟、dim 灰色正常、剪贴板直通、
+# 滚动跟手 —— 远程终端那一整串问题（mosh 丢 dim、231ms 回显、tmux 吃预测）
+# 全部消失。文件也是本地直接读写，由 Mutagen 同步到 vps。
+#
+# 原理：CLAUDE_CONFIG_DIR 会把配置、凭证、会话历史整体隔离到另一个目录，
+# 和你默认账号（~/.claude）互不干扰，可以同时开着。
+#
+# 首次使用需要初始化，二选一：
+#   ccv --login          在这个独立目录里走一次 /login（推荐，凭证各自独立）
+#   ccv --import-vps     把 vps 上的凭证直接搬过来（快，但见下面的告警）
+
+set -uo pipefail
+
+# ---- 统一配置 ----
+# remote-claude 的 config（主机、路径映射）存在就先读进来，这样三个脚本和
+# rcsync 共用同一份主机/路径定义，不会出现"同步到 A、SSH 连 B"的错位。
+# 显式导出的环境变量优先级仍然最高，能盖掉 config 里的值。
+RC_HOME="${RC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/remote-claude}"
+[ -f "$RC_HOME/config" ] && . "$RC_HOME/config"
+
+CFG="${CCV_CONFIG_DIR:-$HOME/.claude-vps}"
+REMOTE="${SSHV_HOST:-${RC_HOST:-vps-64}}"
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+case "${1:-}" in
+    --ccv-help) usage 0 ;;
+    --login)
+        mkdir -p "$CFG"
+        printf '在独立配置目录里登录：%s\n' "$CFG" >&2
+        printf '启动后输入 /login，登录你想用的那个账号。\n\n' >&2
+        CLAUDE_CONFIG_DIR="$CFG" exec claude
+        ;;
+    --import-vps)
+        mkdir -p "$CFG"
+        printf '\033[33m注意：两端共用同一份 refreshToken。Claude Code 会定期用它换新的\n' >&2
+        printf 'accessToken，两边各自刷新可能导致其中一方掉线，需要重新登录。\n' >&2
+        printf '更稳的做法是 ccv --login 各自持有一份凭证。\033[0m\n\n' >&2
+        printf '确认从 %s 导入凭证？[y/N] ' "$REMOTE" >&2
+        read -r ans
+        case "$ans" in
+            y|Y|yes) ;;
+            *) echo "已取消" >&2; exit 1 ;;
+        esac
+        ssh "$REMOTE" 'cat ~/.claude/.credentials.json' > "$CFG/.credentials.json" || {
+            echo "ccv: 拉取凭证失败" >&2; exit 1; }
+        chmod 600 "$CFG/.credentials.json"
+        # oauthAccount 等账号信息在 .claude.json 里，一并带过来
+        ssh "$REMOTE" 'cat ~/.claude.json' > "$CFG/.claude.json.remote" 2>/dev/null && \
+        python3 - "$CFG" <<'PY'
+import json, os, sys
+cfg = sys.argv[1]
+src = os.path.join(cfg, ".claude.json.remote")
+dst = os.path.join(cfg, ".claude.json")
+try:
+    r = json.load(open(src))
+except Exception:
+    sys.exit(0)
+d = {}
+if os.path.exists(dst):
+    try: d = json.load(open(dst))
+    except Exception: d = {}
+# 只取账号身份，不搬 projects/history —— 那些是远端的工作记录，本地用不上
+for k in ("oauthAccount", "organizationUuid", "userID"):
+    if k in r: d[k] = r[k]
+json.dump(d, open(dst, "w"), indent=2)
+os.remove(src)
+print("  已导入账号:", d.get("oauthAccount", {}).get("emailAddress", "?"))
+PY
+        printf '完成。之后直接敲 ccv 即可。\n' >&2
+        exit 0
+        ;;
+esac
+
+[ -f "$CFG/.credentials.json" ] || {
+    printf 'ccv: %s 下还没有凭证。\n' "$CFG" >&2
+    printf '  先跑一次： ccv --login      （推荐）\n' >&2
+    printf '  或者：     ccv --import-vps （从 %s 搬）\n' "$REMOTE" >&2
+    exit 1
+}
+
+CLAUDE_CONFIG_DIR="$CFG" exec claude "$@"

@@ -1,0 +1,50 @@
+# remote-claude 配置 —— sshv / scc / ccv / rcsync 共用这一份
+# 安装到 ~/.config/remote-claude/config 后生效。
+# 它会被 shell source，所以写成变量赋值即可；$HOME 这类展开照常工作。
+
+# ---- 远端主机 ----
+# 必须是 ~/.ssh/config 里的 Host 别名，而不是裸 IP：
+# 保活、连接复用、端口、密钥都定义在那个 Host 块里，Mutagen 和 mosh 都要用到。
+RC_HOST=vps-64
+
+# ---- 路径映射 ----
+# 本地 $RC_LOCAL_ROOT/X  ⇄  远端 $RC_REMOTE_ROOT/X
+# sshv 靠它把"当前目录"翻译成远端目录，rcsync 靠它决定同步哪一对。
+# 两边保持同名，是整套东西能自动对应的前提。
+RC_LOCAL_ROOT="$HOME/workspace"
+RC_REMOTE_ROOT=/root
+
+# ---- 要同步的项目 ----
+# 写目录名即可；两端不同名时写 本地名:远端名
+RC_PROJECTS=(
+    myapp
+    mytool
+    my_sdk
+)
+
+# ---- Claude 状态同步 ----
+RC_LOCAL_CLAUDE="$HOME/.claude"
+RC_REMOTE_CLAUDE=/root/.claude
+
+# 技能目录整体对同步：一端写好的 skill，另一端立刻能用
+RC_SYNC_SKILLS=1
+
+# 会话记录（~/.claude/projects/<编码过的项目路径>/*.jsonl）
+# 两端的目录名不同（本地按 /Users/... 编码、远端按 /root/... 编码），
+# 所以按项目一对一配，rcsync 会自动算出两边的目录名。
+RC_SYNC_SESSIONS=1
+
+# 默认跟随 RC_PROJECTS；只想同步部分项目的会话就在这里单独列
+# RC_SESSION_PROJECTS=(
+#     myapp
+# )
+
+# ---- 额外的自定义同步对 ----
+# 格式：名字|本地路径|远端路径
+RC_EXTRA_PAIRS=(
+    # "agents|$HOME/.claude/agents|/root/.claude/agents"
+    # "commands|$HOME/.claude/commands|/root/.claude/commands"
+)
+
+# Mutagen 会话名前缀（rcsync 新建的会话叫 <前缀>-<目标名>）
+RC_PREFIX=rc

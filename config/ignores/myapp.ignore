@@ -1,0 +1,12 @@
+# 单个目标专属的忽略规则。文件名 = 目标名（见 rcsync list），
+# 内容会叠加在 common.ignore 之上，只对这一个目标生效。
+# 这里以一个前后端分离 + Go 后端的项目为例。
+
+/frontend/dist/
+/backend/.gocache/
+/backend/server          # 编译出来的二进制，几十 MB 且每次构建都变
+*.test
+*.exe
+
+# 跑出来的采集/录制产物，体积大且不需要在另一端看
+/cap/captures-*/

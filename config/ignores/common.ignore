@@ -1,0 +1,31 @@
+# 所有代码目录共用的忽略规则（Mutagen 语法：不带前导 / 的规则在任意层级生效）
+# 每行一条，# 开头是注释，会被 rcsync 逐行转成 --ignore=
+
+.DS_Store
+*.swp
+*~
+
+# 依赖与产物：体积大、可重建，同步它们只会把首次扫描和每次变更都拖慢
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+target/
+dist/
+build/
+.next/
+.turbo/
+
+# Git 的锁和临时对象是两端各自的瞬时状态，同步过去只会互相打架。
+# 注意没有忽略 .git 本身 —— 两端共享提交历史正是这套方案好用的原因，
+# 代价是 .git/index 偶尔会冲突，用 rcsync resolve 挑一端即可。
+.git/index.lock
+.git/**/*.lock
+.git/objects/**/tmp_*
+.git/MERGE_MSG.swp
+
+# Claude Code 在项目里产生的运行期垃圾
+.claude/work-runs/
+.claude/argue-runs/
+.claude/plan-runs/
