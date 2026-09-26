@@ -34,6 +34,7 @@ rcsync up|down|status|flush|conflicts|resolve|doctor   同步（代码 / skills 
 sshv   [add|ls|rm|-c] [名字]                           mosh+tmux 会话管理
 scc    [claude 的任意参数]                              在远端当前项目目录里跑 claude
 ccv    [claude 的任意参数]                              在本地跑 claude，但用远端那套账号
+rcweb  deploy|status|logs|tunnel|dev                   浏览器里用 VPS 上的 Claude（见 docs/06-web.md）
 ```
 
 每个都有 `--help`（scc 是 `--scc-help`，因为 `-h` 要留给 claude）。
@@ -63,6 +64,8 @@ bin/
   sshv        mosh + tmux 会话管理
   scc         远端跑 Claude Code
   ccv         本地跑 Claude Code、用远端账号
+  rcweb       网页端的部署与管理
+server/       网页端：Go 服务（VPS 上跑）+ ui/（React + shadcn/ui，编进二进制）
 config/
   config.example       主配置（主机、路径映射、要同步的项目）
   ssh.config.snippet   推荐的 ~/.ssh/config Host 块
@@ -73,6 +76,7 @@ docs/
   03-scc.md            scc / ccv
   04-claude-state.md   skills 与会话同步
   05-troubleshooting.md
+  06-web.md            网页端 rcweb：部署、访问、安全、用法
 ```
 
 ## 已经手工配过的怎么办

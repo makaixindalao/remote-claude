@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# rcweb — 浏览器里用 VPS 上的 Claude：把 server/ 部署到 VPS 并管理它（在 Mac 上跑）
+#
+#   rcweb deploy           构建前端 + Go 二进制，上传，写 systemd 服务并（重）启动
+#   rcweb build            只构建（产物在 server/dist/）
+#   rcweb status           服务状态 + 健康检查
+#   rcweb logs [-f]        服务日志（-f 持续跟踪）
+#   rcweb restart|stop|start
+#   rcweb tunnel [端口]    SSH 隧道：本机 http://localhost:<端口> → VPS 上的 rcweb
+#   rcweb dev              在本机跑一份（用本地路径），调界面用
+#   rcweb uninstall        停服务，删掉 VPS 上的二进制、服务和环境文件
+#
+# 密码等配置在 server/.env（从 server/.env.example 复制，已被 .gitignore 排除）。
+# 主机、路径、项目列表沿用 ~/.config/remote-claude/config，和 rcsync / scc 是同一份。
+# RCWEB_LISTEN 不是回环地址（如 0.0.0.0:7681）时，deploy 会顺带放行防火墙端口，直接开 http://<VPS IP>:7681。
+
+set -uo pipefail
+
+# ---- 定位仓库与配置 ----
+self="$0"
+while [ -L "$self" ]; do
+    link="$(readlink "$self")"
+    case "$link" in
+        /*) self="$link" ;;
+        *)  self="$(dirname "$self")/$link" ;;
+    esac
+done
+REPO_DIR="$(cd "$(dirname "$self")/.." && pwd)"
+SERVER_DIR="$REPO_DIR/server"
+
+die()  { printf 'rcweb: %s\n' "$*" >&2; exit 1; }
+info() { if [ -t 2 ]; then printf '\033[2m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
+warn() { if [ -t 2 ]; then printf '\033[33m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
+ok()   { if [ -t 2 ]; then printf '\033[32m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
+
+usage() { sed -n '2,16p' "$self" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+RC_HOME="${RC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/remote-claude}"
+# shellcheck disable=SC1091
+[ -f "$RC_HOME/config" ] && . "$RC_HOME/config"
+RC_HOST="${RC_HOST:-vps-64}"
+RC_LOCAL_ROOT="${RC_LOCAL_ROOT:-$HOME/workspace}"
+RC_REMOTE_ROOT="${RC_REMOTE_ROOT:-/root}"
+RC_LOCAL_CLAUDE="${RC_LOCAL_CLAUDE:-$HOME/.claude}"
+RC_REMOTE_CLAUDE="${RC_REMOTE_CLAUDE:-/root/.claude}"
+# bash 3.2（macOS 自带）下未定义数组在 set -u 里会炸，先补空
+declare -p RC_PROJECTS         >/dev/null 2>&1 || RC_PROJECTS=()
+declare -p RC_SESSION_PROJECTS >/dev/null 2>&1 || RC_SESSION_PROJECTS=()
+
+ENV_FILE="${RCWEB_ENV_FILE:-$SERVER_DIR/.env}"
+
+# .env 里某个键的值（最后一次赋值为准，去掉两侧引号）
+envval() {
+    [ -f "$ENV_FILE" ] || return 0
+    sed -n "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1=//p" "$ENV_FILE" | tail -n 1 |
+        sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+need_env() {
+    [ -f "$ENV_FILE" ] || die "没有 $ENV_FILE —— 先 cp server/.env.example server/.env 再改密码"
+    local pw
+    pw="$(envval RCWEB_PASSWORD)"
+    [ -n "$pw" ] || die "$ENV_FILE 里没设 RCWEB_PASSWORD"
+    [ "$pw" != "change-me" ] || die "$ENV_FILE 里的 RCWEB_PASSWORD 还是示例值，先改掉"
+    [[ "$PORT" =~ ^[0-9]+$ ]] || die "$ENV_FILE 里的 RCWEB_LISTEN 看不懂：${LISTEN}（格式 地址:端口）"
+}
+
+LISTEN="$(envval RCWEB_LISTEN)"
+LISTEN="${LISTEN:-127.0.0.1:7681}"
+PORT="${LISTEN##*:}"
+LHOST="${LISTEN%:*}"; LHOST="${LHOST#\[}"; LHOST="${LHOST%\]}"
+# 不是回环地址 = 直接用 http://<IP>:端口 访问（公网模式）
+case "$LHOST" in
+    127.*|localhost|::1) PUBLIC=0 ;;
+    *)                   PUBLIC=1 ;;
+esac
+# VPS 上自己连服务用的地址：监听全部网卡就走回环，绑了具体地址就连它
+case "$LHOST" in
+    ""|0.0.0.0|::) HC_ADDR="127.0.0.1:$PORT" ;;
+    *:*)           HC_ADDR="[$LHOST]:$PORT" ;;
+    *)             HC_ADDR="$LHOST:$PORT" ;;
+esac
+
+# 项目列表：RC_PROJECTS 和 RC_SESSION_PROJECTS 的并集，按 本地名:远端名 取一侧，逗号连接
+projects() {
+    local side="$1" p name seen="," out=""
+    for p in ${RC_PROJECTS[@]+"${RC_PROJECTS[@]}"} ${RC_SESSION_PROJECTS[@]+"${RC_SESSION_PROJECTS[@]}"}; do
+        case "$p" in
+            *:*) if [ "$side" = local ]; then name="${p%%:*}"; else name="${p#*:}"; fi ;;
+            *)   name="$p" ;;
+        esac
+        case "$seen" in *",$name,"*) continue ;; esac
+        seen="$seen$name,"
+        out="${out:+$out,}$name"
+    done
+    printf '%s' "$out"
+}
+
+ssh_() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$RC_HOST" "$@"; }
+
+# 浏览器里开的地址：绑了具体地址就用它，否则用 ~/.ssh/config 里这台机器的 HostName
+public_url() {
+    local h="$LHOST"
+    case "$h" in ""|0.0.0.0|::) h="$(ssh -G "$RC_HOST" 2>/dev/null | awk '$1=="hostname" { print $2; exit }')" ;; esac
+    case "$h" in *:*) h="[$h]" ;; esac
+    printf 'http://%s:%s' "$h" "$PORT"
+}
+
+# 公网模式放行 TCP 端口。只管 VPS 上开着的 ufw / firewalld，云厂商的安全组得去控制台开
+open_port() {
+    local msg
+    msg="$(ssh_ "sh -s $PORT" <<'EOF'
+p="$1"
+if [ "$(id -u)" = 0 ]; then S=""
+elif sudo -n true 2>/dev/null; then S="sudo -n"
+else echo "不是 root、sudo 又要密码，没动防火墙；它若开着，自己放行 TCP $p"; exit 0; fi
+if command -v ufw >/dev/null 2>&1 && $S ufw status 2>/dev/null | grep -q '^Status: active'; then
+    $S ufw allow "$p/tcp" >/dev/null && echo "ufw 已放行 TCP $p" || { echo "ufw 放行 TCP $p 失败"; exit 1; }
+elif command -v firewall-cmd >/dev/null 2>&1 && $S firewall-cmd --state >/dev/null 2>&1; then
+    if $S firewall-cmd -q --query-port="$p/tcp" ||
+       { $S firewall-cmd -q --permanent --add-port="$p/tcp" && $S firewall-cmd -q --reload; }; then
+        echo "firewalld 已放行 TCP $p"
+    else
+        echo "firewalld 放行 TCP $p 失败"; exit 1
+    fi
+fi
+EOF
+)"
+    local rc=$?
+    [ -n "$msg" ] || return 0
+    if [ $rc = 0 ]; then info "$msg"; else warn "$msg"; fi
+}
+
+# 从本机按公网地址连一次：VPS 上健康、这里却连不上，基本就是安全组 / 防火墙没放行
+check_public() {
+    local url; url="$(public_url)"
+    if curl -fsS -m 5 -o /dev/null "$url/healthz" 2>/dev/null; then
+        ok "本机能直接打开 $url"
+    else
+        local px="${http_proxy:-${HTTP_PROXY:-}}"
+        warn "VPS 上服务正常，但本机连不上 $url —— 多半是云厂商安全组（或 VPS 上的 iptables）没放行 TCP ${PORT}，去控制台加一条入站规则${px:+；本机走了代理 ${px}，也可能是代理那头连不上}"
+        return 1
+    fi
+}
+
+# 远端是 root 就装成系统服务，否则装成用户服务
+remote_info() {
+    local line
+    line="$(ssh_ 'printf "%s %s %s %s\n" "$(id -u)" "$(id -un)" "$(uname -m)" "$HOME"')" ||
+        die "连不上 ${RC_HOST}（先 rcsync doctor 看看 SSH）"
+    read -r R_UID R_USER R_ARCH R_HOME <<EOF
+$line
+EOF
+    case "$R_ARCH" in
+        x86_64|amd64)  R_GOARCH=amd64 ;;
+        aarch64|arm64) R_GOARCH=arm64 ;;
+        *) die "不认识的远端架构: $R_ARCH" ;;
+    esac
+    if [ "$R_UID" = 0 ]; then
+        R_BIN=/usr/local/bin/rcweb
+        R_UNIT=/etc/systemd/system/rcweb.service
+        R_ENV=/etc/rcweb.env
+        SCTL="systemctl"
+        JCTL="journalctl -u rcweb"
+    else
+        R_BIN="$R_HOME/.local/bin/rcweb"
+        R_UNIT="$R_HOME/.config/systemd/user/rcweb.service"
+        R_ENV="$R_HOME/.config/rcweb.env"
+        SCTL="systemctl --user"
+        JCTL="journalctl --user -u rcweb"
+    fi
+    DIST="$SERVER_DIR/dist/rcweb-linux-$R_GOARCH"
+}
+
+build_ui() {
+    command -v npm >/dev/null 2>&1 || die "要 npm 才能构建前端（server/ui）"
+    info "构建前端（server/ui）…"
+    (
+        cd "$SERVER_DIR/ui" || exit 1
+        if [ ! -d node_modules ]; then npm ci --no-audit --no-fund || exit 1; fi
+        npm run build --silent
+    ) || die "前端构建失败"
+}
+
+build_go() {
+    command -v go >/dev/null 2>&1 || die "要 go 才能编译服务端（brew install go）"
+    info "编译服务端 → ${1#"$REPO_DIR"/}"
+    (cd "$SERVER_DIR" && CGO_ENABLED=0 GOOS="$2" GOARCH="$3" go build -trimpath -ldflags "-s -w" -o "$1" .) ||
+        die "Go 编译失败"
+}
+
+cmd_build() {
+    remote_info
+    build_ui
+    build_go "$DIST" linux "$R_GOARCH"
+    ok "构建完成: ${DIST#"$REPO_DIR"/}"
+}
+
+unit_file() {
+    cat <<EOF
+[Unit]
+Description=remote-claude web (rcweb)
+After=network.target
+
+[Service]
+Type=simple
+EOF
+    # 显式 User= 才会有 HOME，claude 要靠它找 ~/.claude
+    [ "$R_UID" = 0 ] && echo "User=$R_USER"
+    cat <<EOF
+WorkingDirectory=$R_HOME
+EnvironmentFile=$R_ENV
+Environment=LANG=C.UTF-8
+ExecStart=$R_BIN
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=$([ "$R_UID" = 0 ] && echo multi-user.target || echo default.target)
+EOF
+}
+
+# 远端环境文件：从 config 推导出的几项 + server/.env 原样。.env 里写了的键以它为准
+env_file() {
+    local claude_bin="$1" path="$2" k v
+    printf '# 由 rcweb deploy 生成于 %s。要改请改 Mac 上的 server/.env，再 rcweb deploy\n' "$(date '+%F %T')"
+    while IFS='=' read -r k v; do
+        grep -qE "^[[:space:]]*(export[[:space:]]+)?$k=" "$ENV_FILE" || printf '%s="%s"\n' "$k" "$v"
+    done <<EOF
+RCWEB_ROOT=$RC_REMOTE_ROOT
+RCWEB_PROJECTS=$(projects remote)
+RCWEB_CLAUDE_DIR=$RC_REMOTE_CLAUDE
+RCWEB_CLAUDE_BIN=$claude_bin
+PATH=$path
+EOF
+    grep -vE '^[[:space:]]*(#|$)' "$ENV_FILE"
+}
+
+cmd_deploy() {
+    need_env
+    remote_info
+    local claude_bin rpath
+    # 用登录 shell 找，和你 ssh 上去敲 claude 时的 PATH 一致
+    claude_bin="$(ssh_ 'bash -lc "command -v claude"' 2>/dev/null)" || die "$RC_HOST 上找不到 claude"
+    rpath="$(ssh_ 'bash -lc '\''printf %s "$PATH"'\''')"
+    build_ui
+    build_go "$DIST" linux "$R_GOARCH"
+
+    info "上传到 $RC_HOST:$R_BIN"
+    ssh_ "mkdir -p '$(dirname "$R_BIN")' '$(dirname "$R_UNIT")' '$(dirname "$R_ENV")'" || die "建远端目录失败"
+    # 先传成 .new 再 mv：正在跑的旧二进制不受影响，也不会传一半就被执行
+    ssh_ "cat > '$R_BIN.new' && chmod 755 '$R_BIN.new' && mv -f '$R_BIN.new' '$R_BIN'" < "$DIST" || die "上传失败"
+    env_file "$claude_bin" "$rpath" | ssh_ "umask 077 && cat > '$R_ENV'" || die "写环境文件失败"
+    unit_file | ssh_ "cat > '$R_UNIT'" || die "写 systemd 服务失败"
+    ssh_ "$SCTL daemon-reload && $SCTL enable rcweb >/dev/null 2>&1 && $SCTL restart rcweb" || die "启动服务失败（rcweb logs 看原因）"
+    [ "$R_UID" = 0 ] || warn "用户服务要在你退出登录后继续跑，需要在 VPS 上执行一次: loginctl enable-linger $R_USER"
+
+    sleep 1
+    if ssh_ "curl -fsS -m 5 http://$HC_ADDR/healthz >/dev/null"; then
+        ok "rcweb 已在 $RC_HOST 上运行（监听 ${LISTEN}）"
+    else
+        warn "服务起来了但健康检查没过，最近的日志："
+        ssh_ "$JCTL -n 20 --no-pager"
+        exit 1
+    fi
+
+    if [ "$PUBLIC" = 1 ]; then
+        open_port
+        check_public
+        cat >&2 <<EOF
+
+怎么打开：浏览器开 $(public_url) ，密码是 server/.env 里的 RCWEB_PASSWORD
+  走的是明文 HTTP，别在公共 Wi-Fi 上登录。要加密就把 RCWEB_LISTEN 改回 127.0.0.1:$PORT 再 deploy，
+  改走 rcweb tunnel 或 Tailscale（见 docs/06-web.md）
+EOF
+        return 0
+    fi
+    cat >&2 <<EOF
+
+怎么打开：
+  临时用   rcweb tunnel            然后浏览器开 http://localhost:$PORT
+  长期用   在 VPS 上装 Tailscale 后执行一次
+             tailscale serve --bg $PORT
+           手机 / 其他电脑装上 Tailscale 就能开 https://<机器名>.<tailnet>.ts.net
+  想直接用 IP 开：server/.env 里 RCWEB_LISTEN=0.0.0.0:$PORT，再 rcweb deploy
+EOF
+}
+
+cmd_status() {
+    remote_info
+    ssh_ "$SCTL --no-pager status rcweb 2>&1 | head -n 12"
+    echo
+    if ssh_ "curl -fsS -m 5 http://$HC_ADDR/healthz >/dev/null"; then
+        ok "健康检查通过（${HC_ADDR}）"
+        [ "$PUBLIC" = 1 ] && check_public
+    else
+        warn "健康检查没过（${HC_ADDR}）"
+    fi
+    return 0
+}
+
+cmd_logs() {
+    remote_info
+    case "${1:-}" in
+        -f) ssh_ "$JCTL -n 50 -f" ;;
+        *)  ssh_ "$JCTL -n 200 --no-pager" ;;
+    esac
+}
+
+cmd_tunnel() {
+    local lport="${1:-$PORT}"
+    ok "http://localhost:$lport  → $RC_HOST 上的 rcweb（Ctrl-C 断开）"
+    exec ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L "$lport:$HC_ADDR" "$RC_HOST"
+}
+
+cmd_dev() {
+    need_env
+    [ -f "$SERVER_DIR/ui/dist/index.html" ] || build_ui
+    info "本机跑 rcweb：root=$RC_LOCAL_ROOT  http://$LISTEN"
+    info "改前端想热更新：另开一个终端 cd server/ui && npm run dev（会代理到这个端口）"
+    cd "$SERVER_DIR" || exit 1
+    RCWEB_ROOT="$RC_LOCAL_ROOT" RCWEB_PROJECTS="$(projects local)" RCWEB_CLAUDE_DIR="$RC_LOCAL_CLAUDE" \
+        RCWEB_TERM_SKIP_PERMISSIONS="${RCWEB_TERM_SKIP_PERMISSIONS:-0}" exec go run .
+}
+
+cmd_uninstall() {
+    remote_info
+    printf '停掉 %s 上的 rcweb，并删除 %s、%s、%s？[y/N] ' "$RC_HOST" "$R_BIN" "$R_UNIT" "$R_ENV" >&2
+    read -r ans
+    case "$ans" in y|Y|yes) ;; *) echo "已取消" >&2; exit 1 ;; esac
+    ssh_ "$SCTL disable --now rcweb 2>/dev/null; rm -f '$R_UNIT' '$R_BIN' '$R_ENV'; $SCTL daemon-reload" || die "卸载失败"
+    ok "已卸载"
+}
+
+case "${1:-}" in
+    deploy)            cmd_deploy ;;
+    build)             cmd_build ;;
+    status)            cmd_status ;;
+    logs)              shift; cmd_logs "$@" ;;
+    restart|stop|start) remote_info; ssh_ "$SCTL $1 rcweb" && ok "rcweb 已 $1" ;;
+    tunnel)            shift; cmd_tunnel "$@" ;;
+    dev)               cmd_dev ;;
+    uninstall)         cmd_uninstall ;;
+    ""|-h|--help|help) usage 0 ;;
+    *)                 printf 'rcweb: 未知命令 %s\n\n' "$1" >&2; usage 1 ;;
+esac

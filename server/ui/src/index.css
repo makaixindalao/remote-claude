@@ -1,0 +1,356 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+/* 字体、字号在设置页里改（lib/appearance.ts 把 --rc-* 写到 <html> 上） */
+@theme inline {
+    --font-heading: var(--font-sans);
+    --font-sans: var(--rc-font-sans);
+    --font-mono: var(--rc-font-mono);
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+/* 文字尺寸都乘上 --rc-text-scale，间距、图标不动。text-base 不往小里缩：
+   手机上输入框（text-base）的字小于 16px 的话，iOS 一聚焦就把整页放大 */
+@theme {
+    --text-3xs: calc(0.625rem * var(--rc-text-scale));
+    --text-2xs: calc(0.6875rem * var(--rc-text-scale));
+    --text-xs: calc(0.75rem * var(--rc-text-scale));
+    --text-sm: calc(0.875rem * var(--rc-text-scale));
+    --text-base: calc(1rem * max(1, var(--rc-text-scale)));
+    --text-lg: calc(1.125rem * var(--rc-text-scale));
+    --text-xl: calc(1.25rem * var(--rc-text-scale));
+    --text-2xl: calc(1.5rem * var(--rc-text-scale));
+}
+
+:root {
+    /* 没在设置页改过时的样子 */
+    --rc-font-sans: 'Geist Variable', sans-serif;
+    --rc-font-mono: ui-monospace, monospace;
+    --rc-text-scale: 1;
+
+    /* Claude 的暖色调：象牙白底 + 陶土橙（claude.ai 同款）。
+       陶土橙压到 0.56：按钮上的白字、底色上的橙字（文件链接）对比度都要过 4.5 */
+    --background: oklch(0.982 0.005 95);
+    --foreground: oklch(0.2 0.004 100);
+    --card: oklch(0.995 0.002 95);
+    --card-foreground: oklch(0.2 0.004 100);
+    --popover: oklch(0.995 0.002 95);
+    --popover-foreground: oklch(0.2 0.004 100);
+    --primary: oklch(0.56 0.14 39);
+    --primary-foreground: oklch(0.99 0.003 95);
+    --secondary: oklch(0.945 0.009 95);
+    --secondary-foreground: oklch(0.25 0.005 100);
+    --muted: oklch(0.945 0.009 95);
+    --muted-foreground: oklch(0.54 0.01 95);
+    --accent: oklch(0.93 0.011 95);
+    --accent-foreground: oklch(0.25 0.005 100);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.905 0.009 95);
+    --input: oklch(0.89 0.01 95);
+    --ring: oklch(0.67 0.13 39);
+    --chart-1: oklch(0.87 0 0);
+    --chart-2: oklch(0.556 0 0);
+    --chart-3: oklch(0.439 0 0);
+    --chart-4: oklch(0.371 0 0);
+    --chart-5: oklch(0.269 0 0);
+    --radius: 0.625rem;
+    --sidebar: oklch(0.962 0.008 95);
+    --sidebar-foreground: oklch(0.22 0.004 100);
+    --sidebar-primary: oklch(0.56 0.14 39);
+    --sidebar-primary-foreground: oklch(0.99 0.003 95);
+    --sidebar-accent: oklch(0.925 0.011 95);
+    --sidebar-accent-foreground: oklch(0.2 0.004 100);
+    --sidebar-border: oklch(0.905 0.009 95);
+    --sidebar-ring: oklch(0.67 0.13 39);
+}
+
+.dark {
+    --background: oklch(0.268 0.003 106);
+    --foreground: oklch(0.965 0.006 95);
+    --card: oklch(0.305 0.003 106);
+    --card-foreground: oklch(0.965 0.006 95);
+    --popover: oklch(0.305 0.003 106);
+    --popover-foreground: oklch(0.965 0.006 95);
+    /* 深色底上的橙要亮才看得清，白字压在它上面就不够对比，按钮上改用深色字 */
+    --primary: oklch(0.67 0.131 39);
+    --primary-foreground: oklch(0.2 0.004 100);
+    --secondary: oklch(0.335 0.004 100);
+    --secondary-foreground: oklch(0.965 0.006 95);
+    --muted: oklch(0.335 0.004 100);
+    --muted-foreground: oklch(0.72 0.012 95);
+    --accent: oklch(0.36 0.005 100);
+    --accent-foreground: oklch(0.965 0.006 95);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 14%);
+    --ring: oklch(0.67 0.131 39);
+    --chart-1: oklch(0.87 0 0);
+    --chart-2: oklch(0.556 0 0);
+    --chart-3: oklch(0.439 0 0);
+    --chart-4: oklch(0.371 0 0);
+    --chart-5: oklch(0.269 0 0);
+    --sidebar: oklch(0.225 0.003 80);
+    --sidebar-foreground: oklch(0.94 0.006 95);
+    --sidebar-primary: oklch(0.67 0.131 39);
+    --sidebar-primary-foreground: oklch(0.2 0.004 100);
+    --sidebar-accent: oklch(0.3 0.004 100);
+    --sidebar-accent-foreground: oklch(0.965 0.006 95);
+    --sidebar-border: oklch(1 0 0 / 8%);
+    --sidebar-ring: oklch(0.67 0.131 39);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+/* 消息里的 Markdown（lib/md.ts 产出的 HTML） */
+@layer components {
+  .markdown {
+    overflow-wrap: anywhere;
+  }
+  .markdown > * + * {
+    margin-top: 0.75em;
+  }
+  /* 纯英文段落在对话宽度下一行 100 多个字符，读着累：正文收窄到 ~75 字符一行（中文约 40 字），
+     代码块、表格、图照旧占满 */
+  .markdown > :is(p, ul, ol, blockquote, h2, h3, h4, h5, h6) {
+    max-width: 68ch;
+  }
+  .markdown h2,
+  .markdown h3,
+  .markdown h4,
+  .markdown h5,
+  .markdown h6 {
+    font-weight: 600;
+    margin-top: 1.2em;
+  }
+  .markdown h2 { font-size: 1.15em; }
+  .markdown h3 { font-size: 1.05em; }
+  .markdown ul { list-style: disc; padding-left: 1.4em; }
+  .markdown ol { list-style: decimal; padding-left: 1.6em; }
+  .markdown li + li { margin-top: 0.2em; }
+  .markdown a { color: var(--primary); text-decoration: underline; text-underline-offset: 2px; }
+  .markdown code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    background: var(--muted);
+    border-radius: 0.3em;
+    padding: 0.1em 0.35em;
+  }
+  .markdown pre {
+    font-family: var(--font-mono);
+    font-size: calc(0.8rem * var(--rc-text-scale));
+    line-height: 1.55;
+    background: var(--muted);
+    border-radius: var(--radius-md);
+    padding: 0.7em 0.9em;
+    overflow-x: auto;
+  }
+  .markdown pre code { background: none; padding: 0; font-size: inherit; }
+  .markdown blockquote { border-left: 3px solid var(--border); padding-left: 0.9em; color: var(--muted-foreground); }
+  .markdown hr { border-color: var(--border); }
+  .markdown .table-wrap { overflow-x: auto; }
+  .markdown table { border-collapse: collapse; font-size: 0.9em; }
+  .markdown th,
+  .markdown td { border: 1px solid color-mix(in oklab, var(--foreground) 22%, transparent); padding: 0.35em 0.7em; text-align: left; vertical-align: top; }
+  .markdown th { background: var(--muted); font-weight: 600; }
+}
+
+/* xterm 的滚动条别占宽度 */
+.xterm .xterm-viewport { scrollbar-width: thin; }
+
+/* 运行中那颗星（components/state-dot.tsx 的 ClaudeSpinner）：整颗 8s 转一圈，光芒每 2s 收回一次再伸出。
+   转动放在 <svg> 本身上，浏览器能交给合成层，回复刷屏时也不卡；
+   光芒是 pathLength=1 的线段，靠 stroke-dashoffset 从外端收短，粗细不变。
+   --rc-beat 是 useBeat() 给的相位，同屏的都对齐 */
+@keyframes rc-spark-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes rc-spark-ray {
+  50% { stroke-dashoffset: 0.5; }
+}
+@keyframes rc-spark-fade {
+  50% { opacity: 0.4; }
+}
+.rc-spark {
+  animation: rc-spark-spin 8s linear infinite;
+  animation-delay: var(--rc-beat, 0s);
+}
+.rc-spark path {
+  stroke-dasharray: 1 2;
+  animation: rc-spark-ray 2s ease-in-out infinite;
+  animation-delay: var(--rc-beat, 0s);
+}
+/* 后台任务：慢一半 */
+.rc-spark-slow { animation-duration: 16s; }
+.rc-spark-slow path { animation-duration: 4s; }
+@media (prefers-reduced-motion: reduce) {
+  .rc-spark {
+    animation: rc-spark-fade 2s ease-in-out infinite;
+    animation-delay: var(--rc-beat, 0s);
+  }
+  .rc-spark-slow { animation-duration: 4s; }
+  .rc-spark path { animation: none; }
+}
+
+/* 「思考中 / 正在回复」那行字的扫光：和旁边那颗星同一个 2s 节拍 */
+@keyframes rc-shimmer {
+  from { background-position: 150% 0; }
+  to { background-position: -50% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, var(--muted-foreground) 35%, var(--foreground) 50%, var(--muted-foreground) 65%);
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: rc-shimmer 2s linear infinite;
+  animation-delay: var(--rc-beat, 0s);
+}
+
+/* 压缩上下文时的进度条：claude 不报百分比，只能来回滑 */
+@keyframes rc-indeterminate {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(250%); }
+}
+.progress-indeterminate {
+  position: relative;
+  display: inline-block;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 9999px;
+  background: color-mix(in oklab, var(--primary) 18%, transparent);
+}
+.progress-indeterminate::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  border-radius: inherit;
+  background: var(--primary);
+  animation: rc-indeterminate 1.3s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .shimmer { animation: none; color: var(--muted-foreground); }
+  .progress-indeterminate::after { animation: none; width: 100%; opacity: 0.5; }
+}
+
+/* 代码块卡片、文件链接、mermaid（lib/md.ts 产出，components/markdown.tsx 接交互） */
+@layer components {
+  .markdown .code-block {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--card);
+    overflow: hidden;
+  }
+  .markdown .code-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.25rem 0.5rem 0.25rem 0.9rem;
+    border-bottom: 1px solid var(--border);
+    font-size: calc(0.72rem * var(--rc-text-scale));
+    color: var(--muted-foreground);
+    font-family: var(--font-mono);
+  }
+  .markdown .code-copy {
+    border-radius: var(--radius-sm);
+    padding: 0.1rem 0.5rem;
+    font-family: var(--font-sans);
+    cursor: pointer;
+  }
+  .markdown .code-copy:hover { background: var(--muted); color: var(--foreground); }
+  .markdown .code-block pre { background: transparent; border-radius: 0; margin: 0; }
+
+  .markdown .file-link,
+  .file-link-btn {
+    color: var(--primary);
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+  .markdown .file-link:hover,
+  .file-link-btn:hover { text-decoration-style: solid; }
+  .markdown code .file-link { text-decoration: none; }
+
+  .markdown .mermaid-block {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 0.75rem;
+    overflow-x: auto;
+    background: var(--card);
+  }
+  .markdown .mermaid-block.rendered { display: flex; justify-content: center; }
+  .markdown .mermaid-block svg { max-width: 100%; height: auto; }
+  .markdown .mermaid-error { font-size: var(--text-xs); color: var(--muted-foreground); margin-top: 0.4rem; }
+}
+
+/* highlight.js 配色：浅色偏 GitHub，深色偏 Claude 的暖色 */
+.hljs-comment, .hljs-quote { color: #6e6d68; font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-meta .hljs-keyword { color: #b3401e; }
+.hljs-string, .hljs-regexp, .hljs-addition, .hljs-attr .hljs-string { color: #2e7d32; }
+.hljs-number, .hljs-literal, .hljs-symbol, .hljs-bullet { color: #1f5fbf; }
+.hljs-title, .hljs-title.function_, .hljs-section { color: #8e44ad; }
+.hljs-type, .hljs-title.class_, .hljs-class .hljs-title { color: #9a6700; }
+.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-property { color: #0e7c86; }
+.hljs-meta, .hljs-doctag { color: #8a8983; }
+.hljs-deletion { color: #c0392b; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+.dark .hljs-comment, .dark .hljs-quote { color: #8a8983; }
+.dark .hljs-keyword, .dark .hljs-selector-tag, .dark .hljs-built_in, .dark .hljs-meta .hljs-keyword { color: #f0976f; }
+.dark .hljs-string, .dark .hljs-regexp, .dark .hljs-addition, .dark .hljs-attr .hljs-string { color: #9ee6a8; }
+.dark .hljs-number, .dark .hljs-literal, .dark .hljs-symbol, .dark .hljs-bullet { color: #9bbcff; }
+.dark .hljs-title, .dark .hljs-title.function_, .dark .hljs-section { color: #d7b6ff; }
+.dark .hljs-type, .dark .hljs-title.class_, .dark .hljs-class .hljs-title { color: #f2d28d; }
+.dark .hljs-attr, .dark .hljs-attribute, .dark .hljs-variable, .dark .hljs-template-variable, .dark .hljs-property { color: #8ee6ee; }
+.dark .hljs-deletion { color: #ff8e87; }

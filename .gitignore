@@ -1,1 +1,6 @@
 .DS_Store
+# rcweb：密码等本地配置、编译产物
+server/.env
+server/dist/
+server/ui/dist/
+server/ui/node_modules/
