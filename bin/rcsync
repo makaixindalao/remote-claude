@@ -11,11 +11,13 @@
 #   rcsync conflicts           列出所有冲突及涉及的文件
 #   rcsync resolve <目标> alpha|beta   以某一端为准解决该目标的冲突
 #   rcsync doctor              体检：依赖、守护进程、SSH、远端工具、路径推导
+#   rcsync autodiscover        给新出现的 worktree 会话目录补建同步（只新建、不确认、无事不出声，
+#                              给 launchd 定时跑，见 config/launchd/）
 #
 #   -y / --yes                 跳过确认（新建同步、终止、解冲突都会确认）
 #
-# 目标可以写：项目名（myapp）、sess-<项目名>、skills、
-#             或分组 all / code / sessions / skills（不给参数 = all）
+# 目标可以写：项目名（myapp）、sess-<项目名>、sess-<项目名>-wt-<worktree>、skills、
+#             或分组 all / code / sessions / worktree / skills（不给参数 = all）
 #
 # 配置在 $RC_HOME/config（默认 ~/.config/remote-claude/config），
 # 和 sshv / scc / ccv 共用，保证"同步到哪台"和"SSH 连哪台"永远是同一台。
@@ -41,7 +43,7 @@ info() { if [ -t 2 ]; then printf '\033[2m%s\033[0m\n' "$*" >&2; else printf '%s
 warn() { if [ -t 2 ]; then printf '\033[33m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
 ok()   { if [ -t 2 ]; then printf '\033[32m%s\033[0m\n' "$*" >&2; else printf '%s\n' "$*" >&2; fi; }
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # 帮助要在读配置之前就能出来，否则"还没配置"的人连用法都看不到
 for a in "$@"; do
@@ -66,6 +68,10 @@ RC_REMOTE_CLAUDE="${RC_REMOTE_CLAUDE:-/root/.claude}"
 RC_PREFIX="${RC_PREFIX:-rc}"
 RC_SYNC_SKILLS="${RC_SYNC_SKILLS:-1}"
 RC_SYNC_SESSIONS="${RC_SYNC_SESSIONS:-1}"
+RC_SYNC_WORKTREE_SESSIONS="${RC_SYNC_WORKTREE_SESSIONS:-1}"
+# npx skills 这类工具把技能本体装在 ~/.agents/skills，再往 ~/.claude/skills 里放相对软链
+RC_LOCAL_AGENT_SKILLS="${RC_LOCAL_AGENT_SKILLS:-$HOME/.agents/skills}"
+RC_REMOTE_AGENT_SKILLS="${RC_REMOTE_AGENT_SKILLS:-$(dirname "$RC_REMOTE_CLAUDE")/.agents/skills}"
 
 # bash 3.2（macOS 自带）没有 ${arr[@]:-}，未定义数组在 set -u 下会炸，先补空
 declare -p RC_PROJECTS         >/dev/null 2>&1 || RC_PROJECTS=()
@@ -73,10 +79,19 @@ declare -p RC_SESSION_PROJECTS >/dev/null 2>&1 || RC_SESSION_PROJECTS=()
 declare -p RC_EXTRA_PAIRS      >/dev/null 2>&1 || RC_EXTRA_PAIRS=()
 [ ${#RC_SESSION_PROJECTS[@]} -gt 0 ] || RC_SESSION_PROJECTS=(${RC_PROJECTS[@]+"${RC_PROJECTS[@]}"})
 
-IGNORE_DIR="$RC_HOME/ignores"
-[ -d "$IGNORE_DIR" ] || IGNORE_DIR="$REPO_DIR/config/ignores"
+# 忽略规则逐个文件找：$RC_HOME/ignores 里有同名文件就用它（用户改过的版本），
+# 没有再回落到仓库自带的。不能按整个目录二选一 —— 那样 $RC_HOME/ignores 只要存在，
+# 里面缺的规则文件（比如只放了一个项目专属规则）就会被静默当成"没有规则"，
+# skills 同步会连 synced/ 一起推过去。
+ignore_file() {
+    if   [ -f "$RC_HOME/ignores/$1" ];        then printf '%s' "$RC_HOME/ignores/$1"
+    elif [ -f "$REPO_DIR/config/ignores/$1" ]; then printf '%s' "$REPO_DIR/config/ignores/$1"
+    fi
+}
 
 ASSUME_YES=0
+CREATE_ONLY=0   # up 只新建、不恢复被暂停的会话（autodiscover 用）
+QUIET=0         # 不报"已在同步"这类无事发生的消息（autodiscover 用）
 
 # 内部表格的列分隔符。不能用 \t：tab 属于 IFS 空白，read 会把连续的 tab
 # 当成一个分隔符，于是"空列"整列消失、后面的列全部前移。0x1F(US) 没这个毛病。
@@ -113,6 +128,18 @@ confirm() {
     case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
+# 远端 ~/.claude/projects 的目录清单，发现 worktree 会话用；一次调用只查一次。
+# 连不上就当远端没有，只按本机这侧发现（并提示一句），不让 list/status 因此失败。
+REMOTE_PROJECTS="$TMP/remote-projects"
+list_remote_projects() {
+    [ -f "$REMOTE_PROJECTS" ] && return 0
+    if ! ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$RC_HOST" \
+            "ls -1 $(shq "$RC_REMOTE_CLAUDE/projects")" > "$REMOTE_PROJECTS" 2>/dev/null; then
+        : > "$REMOTE_PROJECTS"
+        warn "连不上 ${RC_HOST}，worktree 会话只按本机这侧发现"
+    fi
+}
+
 # ---- 目标表 ----
 # 每行： 名字 \t 种类 \t alpha路径 \t beta路径(远端) \t ignore文件(逗号分隔)
 #        \t 额外 mutagen 参数 \t 是否允许自动建目录(1/0)
@@ -147,15 +174,55 @@ build_targets() {
                 "claude-sessions.ignore" \
                 "--default-file-mode=0600 --default-directory-mode=0700"
         done
+
+        # Claude 自建的 worktree（claude -w、Remote Control 派生）在 <项目>/.claude/worktrees/<名>，
+        # 会话落在 <项目目录名>--claude-worktrees-<名>（/. 编码成 --）。它们随时新增、名字不可预知，
+        # 所以不写进配置，而是每次按这个前缀从两端现有的目录里找，一个 worktree 配一对。
+        # 前缀里的 --claude-worktrees- 不能省：只按 <项目目录名>- 找会把同级的
+        # myapp-wt、myapp-docs 这类兄弟目录也当成本项目的。
+        if [ "$RC_SYNC_WORKTREE_SESSIONS" = 1 ] && [ ${#RC_SESSION_PROJECTS[@]} -gt 0 ]; then
+            list_remote_projects
+            local lp rp
+            for spec in "${RC_SESSION_PROJECTS[@]}"; do
+                [ -n "$spec" ] || continue
+                lname="${spec%%:*}"
+                rname="${spec#*:}"; [ "$rname" = "$spec" ] && rname="$lname"
+                lp="$(mangle "$(norm "$RC_LOCAL_ROOT/$lname")")--claude-worktrees-"
+                rp="$(mangle "$(norm "$RC_REMOTE_ROOT/$rname")")--claude-worktrees-"
+                {
+                    ls -1 "$RC_LOCAL_CLAUDE/projects" 2>/dev/null | awk -v p="$lp" 'index($0,p)==1{print substr($0,length(p)+1)}'
+                    awk -v p="$rp" 'index($0,p)==1{print substr($0,length(p)+1)}' "$REMOTE_PROJECTS"
+                } | sort -u | while IFS= read -r suf; do
+                    [ -n "$suf" ] || continue
+                    printf "%s${SEP}worktree${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}1\n" \
+                        "sess-$(sanitize "$lname")-wt-$(sanitize "$suf")" \
+                        "$(norm "$RC_LOCAL_CLAUDE/projects/$lp$suf")" \
+                        "$(norm "$RC_REMOTE_CLAUDE/projects/$rp$suf")" \
+                        "claude-sessions.ignore" \
+                        "--default-file-mode=0600 --default-directory-mode=0700"
+                done
+            done
+        fi
     fi
 
     if [ "$RC_SYNC_SKILLS" = 1 ]; then
+        # ~/.claude/skills 里常有 ../../.agents/skills/<名> 这样的相对软链。Mutagen 默认的
+        # portable 模式会跳过越出同步根的软链，所以这里用 posix-raw 把链接原样同步过去，
+        # 链接指向的 ~/.agents/skills 再单独配一对 —— 两端相对布局一致，链接在两端都能解析。
         printf "%s${SEP}skills${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}1\n" \
             "skills" \
             "$(norm "$RC_LOCAL_CLAUDE/skills")" \
             "$(norm "$RC_REMOTE_CLAUDE/skills")" \
             "claude-skills.ignore" \
-            ""
+            "--symlink-mode=posix-raw"
+        if [ -d "$RC_LOCAL_AGENT_SKILLS" ]; then
+            printf "%s${SEP}skills${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}1\n" \
+                "agent-skills" \
+                "$(norm "$RC_LOCAL_AGENT_SKILLS")" \
+                "$(norm "$RC_REMOTE_AGENT_SKILLS")" \
+                "agent-skills.ignore" \
+                ""
+        fi
     fi
 
     local pair
@@ -182,8 +249,9 @@ select_targets() {
     for arg in "$@"; do
         case "$arg" in
             all)                 cat "$TARGETS" >> "$out"; continue ;;
-            code|sessions|skills|extra)
-                                 awk -F"$SEP" -v k="$arg" '$2==k' "$TARGETS" >> "$out"; continue ;;
+            # sessions 分组连 worktree 会话一起算；worktree 分组只含它们
+            code|sessions|skills|extra|worktree)
+                                 awk -F"$SEP" -v k="$arg" '$2==k || (k=="sessions" && $2=="worktree")' "$TARGETS" >> "$out"; continue ;;
         esac
         hit="$(awk -F"$SEP" -v n="$(sanitize "$arg")" '$1==n' "$TARGETS")"
         if [ -z "$hit" ]; then
@@ -222,11 +290,12 @@ ignore_flags() {
     local files="$1" f line
     local IFS=','
     for f in $files; do
-        [ -f "$IGNORE_DIR/$f" ] || continue
+        local path; path="$(ignore_file "$f")"
+        [ -n "$path" ] || continue
         while IFS= read -r line; do
             case "$line" in ''|\#*) continue ;; esac
             printf '%s\n' "--ignore=$line"
-        done < "$IGNORE_DIR/$f"
+        done < "$path"
     done
 }
 
@@ -277,17 +346,18 @@ cmd_up() {
     while IFS="$SEP" read -r name kind a b ign flags mk; do
         s="$(find_session "$a" "$RC_HOST" "$b")"
         if [ -n "$s" ]; then
-            if [ "$(session_field "$s" 6)" = "true" ]; then
+            if [ "$(session_field "$s" 6)" = "true" ] && [ "$CREATE_ONLY" != 1 ]; then
                 printf "%s${SEP}resume${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s\n" "$name" "$a" "$b" "$ign" "$flags" "$mk" "$s" >> "$plan"
             else
-                info "已在同步: ${name}（会话 ${s}）"
+                [ "$QUIET" = 1 ] || info "已在同步: ${name}（会话 ${s}）"
             fi
             continue
         fi
         printf "%s${SEP}create${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s${SEP}%s\n" "$name" "$a" "$b" "$ign" "$flags" "$mk" "" >> "$plan"
     done < "$sel"
 
-    [ -s "$plan" ] || { ok "全部目标都已在同步。"; return 0; }
+    [ -s "$plan" ] || { [ "$QUIET" = 1 ] || ok "全部目标都已在同步。"; return 0; }
+    [ "$QUIET" = 1 ] && printf '%s\n' "$(date '+%F %T')" >&2
 
     local news; news="$(awk -F"$SEP" '$2=="create"' "$plan" | wc -l | tr -d ' ')"
     if [ "$news" -gt 0 ]; then
@@ -456,6 +526,15 @@ EOF
     mutagen sync flush "$s" && ok "完成。再跑 rcsync conflicts 确认。"
 }
 
+# Claude 自建的 worktree 随时新增，靠人记得跑 up 不现实。这个入口给 launchd 定时调：
+# 只给新发现的 worktree 会话目录建同步，不碰被暂停的，不问确认，没事时一个字也不打。
+cmd_autodiscover() {
+    ASSUME_YES=1; CREATE_ONLY=1; QUIET=1
+    [ "$RC_SYNC_SESSIONS" = 1 ] && [ "$RC_SYNC_WORKTREE_SESSIONS" = 1 ] || return 0
+    awk -F"$SEP" '$2=="worktree"{f=1}END{exit !f}' "$TARGETS" || return 0
+    cmd_up worktree
+}
+
 cmd_doctor() {
     local bad=0
     printf '== 本机 ==\n'
@@ -534,6 +613,7 @@ case "$cmd" in
     conflicts|conf)   cmd_conflicts "$@" ;;
     resolve)          cmd_resolve "$@" ;;
     doctor)           cmd_doctor ;;
+    autodiscover)     cmd_autodiscover ;;
     help)             usage 0 ;;
     *)                die "未知命令: ${cmd}（rcsync --help 看用法）" ;;
 esac

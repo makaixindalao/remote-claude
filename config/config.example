@@ -26,13 +26,19 @@ RC_PROJECTS=(
 RC_LOCAL_CLAUDE="$HOME/.claude"
 RC_REMOTE_CLAUDE=/root/.claude
 
-# 技能目录整体对同步：一端写好的 skill，另一端立刻能用
+# 技能目录整体对同步：一端写好的 skill，另一端立刻能用。
+# ~/.agents/skills 存在时一并同步（~/.claude/skills 里的相对软链指向那里）；
+# 位置不同就改 RC_LOCAL_AGENT_SKILLS / RC_REMOTE_AGENT_SKILLS
 RC_SYNC_SKILLS=1
 
 # 会话记录（~/.claude/projects/<编码过的项目路径>/*.jsonl）
 # 两端的目录名不同（本地按 /Users/... 编码、远端按 /root/... 编码），
 # 所以按项目一对一配，rcsync 会自动算出两边的目录名。
 RC_SYNC_SESSIONS=1
+
+# Claude 自建 worktree（<项目>/.claude/worktrees/*）里的会话：按目录前缀自动发现，
+# 配合 launchd 定时跑 rcsync autodiscover（config/launchd/）自动补建同步
+RC_SYNC_WORKTREE_SESSIONS=1
 
 # 默认跟随 RC_PROJECTS；只想同步部分项目的会话就在这里单独列
 # RC_SESSION_PROJECTS=(

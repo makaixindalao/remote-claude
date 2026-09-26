@@ -1,0 +1,3 @@
+# ~/.agents/skills 的忽略规则（npx skills 等工具装技能本体的地方，
+# ~/.claude/skills 里的相对软链指向这里）
+.DS_Store

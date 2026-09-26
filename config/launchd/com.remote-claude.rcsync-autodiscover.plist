@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  每 5 分钟跑一次 rcsync autodiscover，给新出现的 Claude worktree 会话目录补建同步。
+  安装（__HOME__ 换成你的家目录）：
+    sed "s|__HOME__|$HOME|g" config/launchd/com.remote-claude.rcsync-autodiscover.plist \
+      > ~/Library/LaunchAgents/com.remote-claude.rcsync-autodiscover.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.remote-claude.rcsync-autodiscover.plist
+  卸载：
+    launchctl bootout gui/$(id -u)/com.remote-claude.rcsync-autodiscover
+  日志只在真的新建了同步时才有内容：~/Library/Logs/rcsync-autodiscover.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.remote-claude.rcsync-autodiscover</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/rcsync</string>
+        <string>autodiscover</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd 不读 shell 配置，mutagen 在 Homebrew 目录下，得显式给 PATH -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/rcsync-autodiscover.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/rcsync-autodiscover.log</string>
+</dict>
+</plist>
