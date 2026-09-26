@@ -1,4 +1,6 @@
 .DS_Store
+# deploy.sh：部署目标等本地信息
+/.env
 # rcweb：密码等本地配置、编译产物
 server/.env
 server/dist/

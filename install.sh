@@ -4,6 +4,8 @@
 #   ./install.sh              安装（命令软链接 + 配置 + 环境检查）
 #   ./install.sh --force      覆盖已存在的配置文件
 #   ./install.sh --bin-dir D  命令装到 D（默认 ~/.local/bin）
+#   ./install.sh --keep-existing  已有的同名命令不是本仓库的链接时保留不动（deploy.sh 用）
+#   ./install.sh --no-ignores     不往配置目录拷忽略规则：rcsync 找不到时用仓库里的，随仓库更新
 #
 # 装的是软链接而不是拷贝：改仓库里的脚本立刻生效，不用重装。
 # 原有的同名文件会备份成 <名字>.bak.<时间戳>，不会被直接覆盖。
@@ -14,12 +16,16 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 RC_HOME="${RC_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/remote-claude}"
 FORCE=0
+KEEP=0
+IGNORES=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --force)   FORCE=1; shift ;;
+        --keep-existing) KEEP=1; shift ;;
+        --no-ignores) IGNORES=0; shift ;;
         --bin-dir) BIN_DIR="$2"; shift 2 ;;
-        -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'install: 未知参数 %s\n' "$1" >&2; exit 1 ;;
     esac
 done
@@ -56,8 +62,10 @@ for f in "$REPO"/bin/*; do
     if [ -L "$t" ]; then
         cur="$(readlink "$t")"
         if [ "$cur" = "$f" ]; then ok "${n}（已是本仓库的链接）"; continue; fi
+        if [ "$KEEP" = 1 ]; then warn "${n} 保留不动（现在指向 ${cur}）"; continue; fi
         rm -f "$t"
     elif [ -e "$t" ]; then
+        if [ "$KEEP" = 1 ]; then warn "${n} 保留不动（是你自己的文件，不是本仓库的链接）"; continue; fi
         mv "$t" "$t.bak.$TS" || { bad "$n 备份失败"; continue; }
         warn "$n 原文件已备份为 $n.bak.$TS"
     fi
@@ -82,7 +90,9 @@ else
 fi
 for f in "$REPO"/config/ignores/*.ignore; do
     n="$(basename "$f")"
-    if [ -f "$RC_HOME/ignores/$n" ] && [ "$FORCE" != 1 ]; then
+    if [ "$IGNORES" = 0 ]; then
+        [ -f "$RC_HOME/ignores/$n" ] && ok "ignores/${n}（用你改过的这份）" || ok "ignores/${n}（用仓库里的）"
+    elif [ -f "$RC_HOME/ignores/$n" ] && [ "$FORCE" != 1 ]; then
         ok "ignores/$n 已存在，保留不动"
     else
         cp "$f" "$RC_HOME/ignores/$n" && ok "ignores/$n"

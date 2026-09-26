@@ -14,6 +14,18 @@ VPS 上跑 Claude 有三个绕不开的问题，这个项目就是这三个问�
 
 ## 快速开始
 
+新 VPS 一条命令部署（两端环境都自动检测、缺了自动装）：
+
+```sh
+cp .env.example .env              # 填 DEPLOY_TARGET=root@1.2.3.4:22
+./deploy.sh                       # 按 .env 一键部署，不确认：SSH 免密、本机配置、VPS 上的 tmux/mosh/claude、网页端 rcweb（http://<VPS IP>:7681）
+./deploy.sh --no-env              # 不用 .env：交互式输入部署信息，每步确认（没有 .env 时默认就是这样）
+./deploy.sh --check               # 只检测两端环境，不装不改
+```
+
+`deploy.sh` 能反复跑：已经对了的步骤会跳过。`~/.ssh/config` 里已有指向同一台机器的 Host
+就沿用它，没有才新建。下面是手工一步步来的做法：
+
 ```sh
 cd ~/workspace/tool/remote-claude  # 或你放它的任何位置
 ./install.sh                      # 软链命令到 ~/.local/bin，配置写到 ~/.config/remote-claude
@@ -59,6 +71,8 @@ Claude 的会话目录名也是从这两条路径各自推导出来的。所以�
 ## 目录
 
 ```
+deploy.sh     一条命令部署到新 VPS（部署信息在 .env，模板 .env.example）
+install.sh    只装本机：命令软链 + 配置
 bin/
   rcsync      Mutagen 同步统一入口（本项目新增）
   sshv        mosh + tmux 会话管理
